@@ -30,3 +30,18 @@ if response.status_code == 200:
 else:
     st.error("❌ Connection failed")
     st.text(response.text)
+
+# Pull Permission Roles (RBP) - LIVE
+rbp_url = f"{base_url}/odata/v2/PermissionRole?$format=json"
+
+rbp_response = requests.get(
+    rbp_url,
+    auth=HTTPBasicAuth(username, password)
+)
+
+if rbp_response.status_code == 200:
+    rbp_data = rbp_response.json()
+    role_count = len(rbp_data["d"]["results"])
+    st.metric("Permission Roles (Live)", role_count)
+else:
+    st.warning("⚠️ Unable to fetch Permission Roles")
