@@ -20,7 +20,22 @@ response = requests.get(
 )
 
 if response.status_code == 200:
-    user_count = response.headers.get("X-Total-Count", "Unknown")
+    url = f"{base_url}/odata/v2/PerPerson?$top=1&$inlinecount=allpages"
+
+response = requests.get(
+    url,
+    auth=HTTPBasicAuth(username, password)
+)
+
+if response.status_code == 200:
+    data = response.json()
+    user_count = data["d"]["__count"]
+
+    st.success("✅ Live SuccessFactors connection successful")
+    st.metric("Total Users (Live)", user_count)
+else:
+    st.error("❌ Connection failed")
+    st.text(response.text)
     st.success("✅ Live SuccessFactors connection successful")
     st.metric("Total Users (Live)", user_count)
 else:
