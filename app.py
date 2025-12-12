@@ -59,10 +59,24 @@ if meta_response.status_code != 200:
 meta_data = meta_response.json()
 
 # Extract unique roleIds
-role_ids = {
-    r.get("roleId")
-    for r in meta_data["d"]["results"]
-    if r.get("roleId")
-}
+# Handle different SF response shapes for function imports
+d_block = meta_data.get("d")
 
-st.metric("Permission Roles (Live)", len(role_ids))
+if isinstance(d_block, list):
+    records = d_block
+elif isinstance(d_block, dict):
+    records = d_block.get("results") or d_block.get("value") or []
+else:
+    records = []
+
+if not records:
+    st.warning("⚠️ Permission metadata returned no roles")
+else:
+    role_ids = {
+        r.get("roleId")
+        for r in records
+        if isinstance(r, dict) and r.get("roleId")
+    }
+
+    st.metric("Permission Roles (Live)", len(role_ids))
+
