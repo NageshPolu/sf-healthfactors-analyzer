@@ -4,44 +4,65 @@ from requests.auth import HTTPBasicAuth
 
 st.title("SF Live Risk Analyzer")
 
-# Read secrets
+# --- Read secrets ---
 base_url = st.secrets["SF_BASE_URL"]
 username = st.secrets["SF_USERNAME"]
 password = st.secrets["SF_PASSWORD"]
 
 st.info("Connecting to SuccessFactors (read-only)...")
 
-# Correct OData call for user count
-url = f"{base_url}/odata/v2/PerPerson?$top=1&$inlinecount=allpages&$format=json"
+# --------------------------------------------------
+# STEP 1: Get TOTAL USER COUNT (already working)
+# --------------------------------------------------
+user_url = (
+    f"{base_url}/odata/v2/PerPerson"
+    "?$top=1"
+    "&$inlinecount=allpages"
+    "&$format=json"
+)
 
-
-response = requests.get(
-    url,
+user_response = requests.get(
+    user_url,
     auth=HTTPBasicAuth(username, password)
 )
 
-if response.status_code == 200:
-    data = response.json()
-    user_count = data["d"]["__count"]
+if user_response.status_code != 200:
+    st.error("❌ Failed to fetch user count")
+    st.text(user_response.text)
+    st.stop()
 
-    st.success("✅ Live SuccessFactors connection successful")
-    st.metric("Total Users (Live)", user_count)
+user_data = user_response.json()
+user_count = user_data["d"]["__count"]
 
-else:
-    st.error("❌ Connection failed")
-    st.text(response.text)
+st.success("✅ Live SuccessFactors connection successful")
+st.metric("Total Users (Live)", user_count)
 
-# Pull Permission Roles (RBP) - LIVE
-rbp_url = f"{base_url}/odata/v2/PermissionRole?$format=json"
+# --------------------------------------------------
+# STEP 2: Get PERMISSION METADATA (THIS IS meta_url)
+# --------------------------------------------------
+meta_url = (
+    f"{base_url}/odata/v2/getPermissionMetadata"
+    "?locale=en_US"
+    "&$format=json"
+)
 
-rbp_response = requests.get(
-    rbp_url,
+meta_response = requests.get(
+    meta_url,
     auth=HTTPBasicAuth(username, password)
 )
 
-if rbp_response.status_code == 200:
-    rbp_data = rbp_response.json()
-    role_count = len(rbp_data["d"]["results"])
-    st.metric("Permission Roles (Live)", role_count)
-else:
-    st.warning("⚠️ Unable to fetch Permission Roles")
+if meta_response.status_code != 200:
+    st.error("❌ Failed to fetch permission metadata")
+    st.text(meta_response.text)
+    st.stop()
+
+meta_data = meta_response.json()
+
+# Extract unique roleIds
+role_ids = {
+    r.get("roleId")
+    for r in meta_data["d"]["results"]
+    if r.get("roleId")
+}
+
+st.metric("Permission Roles (Live)", len(role_ids))
