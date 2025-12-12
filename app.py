@@ -12,7 +12,8 @@ password = st.secrets["SF_PASSWORD"]
 st.info("Connecting to SuccessFactors (read-only)...")
 
 # Correct OData call for user count
-url = f"{base_url}/odata/v2/PerPerson?$top=1&$inlinecount=allpages"
+url = f"{base_url}/odata/v2/PerPerson?$top=1&$inlinecount=allpages&$format=json"
+
 
 response = requests.get(
     url,
