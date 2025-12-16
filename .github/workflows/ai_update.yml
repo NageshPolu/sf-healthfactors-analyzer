@@ -9,10 +9,15 @@ permissions:
   pull-requests: write
   issues: read
 
+concurrency:
+  group: ai-update-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   ai_update:
     if: github.event.label.name == 'ai-update'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -28,11 +33,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run AI updater
+      - name: Connectivity check (OpenAI)
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          echo "DNS:"
+          getent hosts api.openai.com || true
+          echo "TLS/HTTP:"
+          curl -I --connect-timeout 10 --max-time 30 https://api.openai.com/v1 || true
+          echo "Auth test:"
+          curl -sS --retry 6 --retry-all-errors --connect-timeout 10 --max-time 60 \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            https://api.openai.com/v1/models | head -c 200 || true
 
+      - name: Run AI updater
+        env:
+          # OpenAI
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4.1-mini
+
+          # GitHub token (use built-in)
+          GITHUB_TOKEN: ${{ github.token }}
+
+          # Issue/repo context
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
@@ -40,6 +64,7 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
 
+          # Run metadata
           GITHUB_ACTOR: ${{ github.actor }}
           RUN_ID: ${{ github.run_id }}
           RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
