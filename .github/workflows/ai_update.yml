@@ -26,25 +26,13 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install openai requests
+          pip install -r requirements.txt
 
       - name: Run AI updater
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          REPO: ${{ github.repository }}
         run: |
+          ls -la
+          ls -la tools
           python tools/ai_update.py
-
-      - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "AI update from issue #${{ github.event.issue.number }}"
-          branch: "ai-update/issue-${{ github.event.issue.number }}"
-          title: "AI update from issue #${{ github.event.issue.number }}"
-          body: |
-            Auto-generated changes from issue #${{ github.event.issue.number }}.
-            Please review before merging.
