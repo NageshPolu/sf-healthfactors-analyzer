@@ -5,6 +5,27 @@ import streamlit as st
 from datetime import datetime, timezone
 import pandas as pd
 import io
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+# -----------------------------
+# HEALTHCHECK ENDPOINT (for FastAPI)
+# -----------------------------
+try:
+    app = st._main._get_app()  # This will fail if not running in FastAPI context
+except Exception:
+    app = None
+
+if app is None:
+    try:
+        app = FastAPI()
+    except Exception:
+        app = None
+
+if app is not None:
+    @app.get("/healthcheck")
+    async def healthcheck():
+        return JSONResponse(content={"status": "ok"})
 
 # -----------------------------
 # CONFIG
