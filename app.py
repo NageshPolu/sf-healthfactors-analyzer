@@ -1,255 +1,291 @@
 import os
 import json
+from io import BytesIO
+from datetime import datetime
+
 import requests
-import streamlit as st
-from datetime import datetime, timezone
 import pandas as pd
-import io
+import streamlit as st
 
-# -----------------------------
-# CONFIG
-# -----------------------------
-OWNER = st.secrets.get("GITHUB_OWNER", os.getenv("GITHUB_OWNER", "NageshPolu"))
-FRONTEND_REPO = st.secrets.get("FRONTEND_REPO", os.getenv("FRONTEND_REPO", "sf-healthfactors-analyzer"))
-BACKEND_REPO = st.secrets.get("BACKEND_REPO", os.getenv("BACKEND_REPO", "sf-ec-gates-backend"))
-GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", os.getenv("GITHUB_TOKEN", ""))
-
-# Your backend API endpoint (Render)
-# If you already have a different endpoint, replace it here.
-BACKEND_BASE = os.getenv("BACKEND_BASE", "https://sf-ec-gates-backend.onrender.com")
-RUN_ENDPOINT = f"{BACKEND_BASE.rstrip('/')}/run"
-
-# -----------------------------
-# HELPERS
-# -----------------------------
-def gh_headers():
-    if not GITHUB_TOKEN:
-        return {}
-    return {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-
-def create_github_issue(repo: str, title: str, body: str, labels=None):
-    labels = labels or []
-    url = f"https://api.github.com/repos/{OWNER}/{repo}/issues"
-    payload = {"title": title, "body": body, "labels": labels}
-    r = requests.post(url, headers=gh_headers(), json=payload, timeout=30)
-
-    # Helpful error message for noobs
-    if r.status_code >= 300:
-        try:
-            data = r.json()
-        except Exception:
-            data = {"raw": r.text}
-        raise RuntimeError(f"GitHub issue create failed ({r.status_code}): {data}")
-
-    return r.json()
-
-def safe_df(data):
-    # Avoid importing pandas if not needed; Streamlit can render list[dict] directly.
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        st.dataframe(data, use_container_width=True)
-    else:
-        st.write(data)
-
-def drilldown_block(title: str, rows, empty_msg: str):
-    st.subheader(title)
-    if not rows:
-        st.info(empty_msg)
-        return
-    safe_df(rows)
-
-def now_utc_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-# -----------------------------
-# PAGE
-# -----------------------------
 st.set_page_config(page_title="SF EC Go-Live Gates", layout="wide")
-st.title("SF EC Go-Live Gates (API-only)")
 
-# -----------------------------
-# SIDEBAR: AI UPDATE REQUEST
-# -----------------------------
-st.sidebar.header("🤖 AI Update Request (No-code)")
 
-st.sidebar.caption(
-    "Type what you want changed. This will create a GitHub Issue with label `ai-update`.\n"
-    "A GitHub Action will pick it up and create a PR automatically."
-)
+# ----------------------------
+# Config
+# ----------------------------
+API_BASE_URL = st.secrets.get("API_BASE_URL", os.getenv("API_BASE_URL", "")).rstrip("/")
+API_TIMEOUT_GET = 60
+API_TIMEOUT_POST = 180
 
-target = st.sidebar.radio(
-    "Where should the change happen?",
-    ["Streamlit UI (frontend)", "Render API (backend)"],
-    index=0,
-)
+if not API_BASE_URL:
+    st.error("Missing API_BASE_URL. Add it in Streamlit Secrets (Settings → Secrets).")
+    st.stop()
 
-repo_target = FRONTEND_REPO if target.startswith("Streamlit") else BACKEND_REPO
 
-request_text = st.sidebar.text_area(
-    "What do you want to add/change?",
-    placeholder="Example: Add a new drilldown for inactive users, and add a CSV download button.",
-    height=140,
-)
-
-extra_context = st.sidebar.text_area(
-    "Optional extra context",
-    placeholder="Example: Use endpoint /run; keep the UI minimal; don't show PII in PDF.",
-    height=90,
-)
-
-if st.sidebar.button("Create GitHub Issue", type="primary", disabled=not request_text.strip()):
-    if not GITHUB_TOKEN:
-        st.sidebar.error("Missing GITHUB_TOKEN in Streamlit secrets. Add it in Streamlit → Settings → Secrets.")
-    else:
-        issue_title = f"AI update request: {request_text.strip()[:60]}"
-        issue_body = (
-            f"**Requested at (UTC):** {now_utc_iso()}\n\n"
-            f"## Request\n{request_text.strip()}\n\n"
-            f"## Extra context\n{extra_context.strip() or '(none)'}\n\n"
-            f"## Notes\n"
-            f"- Please keep responses safe (no secrets in logs).\n"
-            f"- Prefer small PRs and explain what changed.\n"
-        )
-        try:
-            issue = create_github_issue(
-                repo=repo_target,
-                title=issue_title,
-                body=issue_body,
-                labels=["ai-update"],
-            )
-            st.sidebar.success(f"Issue created in `{repo_target}` ✅")
-            st.sidebar.markdown(f"[Open Issue]({issue.get('html_url')})")
-        except Exception as e:
-            st.sidebar.error(str(e))
-
-st.sidebar.divider()
-st.sidebar.caption("Live backend endpoint used:")
-st.sidebar.code(RUN_ENDPOINT)
-
-# -----------------------------
-# MAIN: RUN DASHBOARD
-# -----------------------------
-st.info("Pulling a live snapshot from the backend API (Render)…")
-
-colA, colB = st.columns([1, 1], gap="large")
-
-run = st.button("Refresh snapshot")
-
-if run or "snapshot" not in st.session_state:
+# ----------------------------
+# API helpers
+# ----------------------------
+def api_request(method: str, path: str, payload=None):
+    url = f"{API_BASE_URL}{path}"
     try:
-        r = requests.post(RUN_ENDPOINT, json={}, timeout=120)
-        # If backend returns text error, show it
-        if r.status_code >= 300:
-            st.error(f"Backend error {r.status_code}: {r.text}")
-            st.stop()
-        st.session_state.snapshot = r.json()
+        if method.upper() == "GET":
+            r = requests.get(url, timeout=API_TIMEOUT_GET)
+        else:
+            r = requests.post(url, json=payload, timeout=API_TIMEOUT_POST)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        # Show API error body if available
+        try:
+            detail = r.text[:1000]  # noqa: F821
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"API HTTP error: {e}\n{detail}") from e
     except Exception as e:
-        st.error(f"Failed to call backend: {e}")
-        st.stop()
+        raise RuntimeError(f"API connection error: {e}") from e
 
-snap = st.session_state.snapshot
 
-# Support both shapes:
-# - backend returns {"metrics": {...}} or directly {...}
-metrics = snap.get("metrics", snap)
+@st.cache_data(ttl=20)
+def get_health():
+    return api_request("GET", "/health")
 
-snapshot_time = metrics.get("snapshot_time_utc") or metrics.get("snapshotTimeUtc") or "Unknown"
-st.caption(f"Last snapshot (UTC): {snapshot_time}")
 
-active_users = int(metrics.get("active_users", metrics.get("activeUsers", 0)) or 0)
-missing_mgr_count = int(metrics.get("missing_manager_count", metrics.get("missingManagerCount", 0)) or 0)
-missing_mgr_pct = metrics.get("missing_manager_pct", metrics.get("missingManagerPct", 0)) or 0
-invalid_org_count = int(metrics.get("invalid_org_count", metrics.get("invalidOrgCount", 0)) or 0)
-invalid_org_pct = metrics.get("invalid_org_pct", metrics.get("invalidOrgPct", 0)) or 0
-risk_score = int(metrics.get("risk_score", metrics.get("riskScore", 0)) or 0)
+def run_now():
+    return api_request("POST", "/run")
+
+
+def get_latest():
+    return api_request("GET", "/metrics/latest")
+
+
+# ----------------------------
+# PDF export (summary only)
+# ----------------------------
+def build_pdf_bytes(metrics: dict, include_samples: bool = False) -> bytes:
+    """
+    Creates a clean PDF summary.
+    If reportlab isn't installed, it raises ImportError (we show a helpful message).
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    def line(y, text, size=10, bold=False):
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", size)
+        c.drawString(40, y, str(text))
+
+    y = h - 50
+    line(y, "SuccessFactors EC Go-Live Gates — Snapshot", 16, bold=True)
+    y -= 22
+
+    snap = metrics.get("snapshot_time_utc", "")
+    line(y, f"Snapshot (UTC): {snap}", 10)
+    y -= 18
+
+    # KPI block
+    kpis = [
+        ("Active users", metrics.get("active_users", 0)),
+        ("EmpJob rows", metrics.get("current_empjob_rows", 0)),
+        ("Missing managers", f"{metrics.get('missing_manager_count', 0)} ({metrics.get('missing_manager_pct', 0)}%)"),
+        ("Invalid org", f"{metrics.get('invalid_org_count', 0)} ({metrics.get('invalid_org_pct', 0)}%)"),
+        ("Missing emails", metrics.get("missing_email_count", 0)),
+        ("Duplicate emails", metrics.get("duplicate_email_count", 0)),
+        ("Risk score", metrics.get("risk_score", 0)),
+    ]
+
+    line(y, "Key metrics", 12, bold=True)
+    y -= 16
+    for k, v in kpis:
+        line(y, f"• {k}: {v}", 10)
+        y -= 14
+
+    y -= 8
+    line(y, "Org missing field counts", 12, bold=True)
+    y -= 16
+    org_counts = metrics.get("org_missing_field_counts", {}) or {}
+    for k, v in org_counts.items():
+        line(y, f"• {k}: {v}", 10)
+        y -= 14
+
+    if include_samples:
+        y -= 10
+        line(y, "Samples (limited)", 12, bold=True)
+        y -= 16
+
+        def add_sample(title, rows, cols=("userId",), max_rows=10):
+            nonlocal y
+            line(y, title, 11, bold=True)
+            y -= 14
+            for i, r in enumerate(rows[:max_rows]):
+                bits = []
+                for col in cols:
+                    bits.append(f"{col}={r.get(col)}")
+                line(y, f"• {', '.join(bits)}", 9)
+                y -= 12
+                if y < 80:
+                    c.showPage()
+                    y = h - 50
+
+        add_sample("Missing manager", metrics.get("missing_manager_sample", []) or [], cols=("userId", "managerId"))
+        add_sample("Invalid org", metrics.get("invalid_org_sample", []) or [], cols=("userId", "missingFields"))
+        add_sample("Missing email", metrics.get("missing_email_sample", []) or [], cols=("userId", "username"))
+        add_sample("Duplicate emails", metrics.get("duplicate_email_sample", []) or [], cols=("email", "count"))
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+# ----------------------------
+# UI
+# ----------------------------
+st.title("✅ SuccessFactors EC Go-Live Gates (Streamlit UI + Render API)")
+
+with st.sidebar:
+    st.header("Connection")
+    st.code(API_BASE_URL, language="text")
+    st.caption("Streamlit calls Render. Render calls SuccessFactors.")
+
+    auto_refresh = st.toggle("Auto-refresh latest snapshot", value=False)
+    refresh_seconds = st.slider("Refresh every (seconds)", 15, 120, 30, disabled=not auto_refresh)
+
+    st.divider()
+    st.header("PDF export")
+    include_samples_in_pdf = st.toggle("Include samples in PDF", value=False)
+
+# Health
+try:
+    health = get_health()
+    ok = bool(health.get("ok"))
+    st.success("Backend reachable ✅" if ok else "Backend responded but not OK ⚠️")
+except Exception as e:
+    st.error(f"Backend not reachable: {e}")
+    st.stop()
+
+# Actions row
+c1, c2, c3 = st.columns([1.2, 1.2, 2.6])
+
+with c1:
+    if st.button("🔄 Run live check now", use_container_width=True):
+        with st.spinner("Calling backend… fetching from SuccessFactors…"):
+            out = run_now()
+        st.success(f"Run complete: {out.get('snapshot_time_utc', '')}")
+        st.cache_data.clear()
+        st.rerun()
+
+with c2:
+    if st.button("📥 Refresh latest snapshot", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+with c3:
+    st.info("Tip: Use **Run live check now** to pull real-time SF data via Render, then view it below.")
+
+# Auto refresh
+if auto_refresh:
+    st.caption(f"Auto-refresh enabled: every {refresh_seconds}s")
+    st.autorefresh(interval=refresh_seconds * 1000, key="auto_refresh_key")
+
+# Fetch latest snapshot
+data = get_latest()
+if data.get("status") != "ok":
+    st.warning("No snapshots yet. Click **Run live check now**.")
+    st.stop()
+
+m = data["metrics"] or {}
+
+# KPI tiles
+k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1.metric("Active users", m.get("active_users", 0))
+k2.metric("EmpJob rows", m.get("current_empjob_rows", 0))
+k3.metric("Missing managers", m.get("missing_manager_count", 0), f'{m.get("missing_manager_pct", 0)}%')
+k4.metric("Invalid org", m.get("invalid_org_count", 0), f'{m.get("invalid_org_pct", 0)}%')
+k5.metric("Missing emails", m.get("missing_email_count", 0))
+k6.metric("Risk score", m.get("risk_score", 0))
+
+st.caption(f"Snapshot UTC: {m.get('snapshot_time_utc', '')}")
+
+# PDF download (clean summary)
+pdf_col1, pdf_col2 = st.columns([1.2, 3.8])
+with pdf_col1:
+    try:
+        pdf_bytes = build_pdf_bytes(m, include_samples=include_samples_in_pdf)
+        fname = f"sf_ec_gates_{m.get('snapshot_time_utc','snapshot').replace(':','-')}.pdf"
+        st.download_button(
+            "⬇️ Download PDF summary",
+            data=pdf_bytes,
+            file_name=fname,
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    except ImportError:
+        st.warning("PDF export requires 'reportlab'. Add it to requirements.txt.")
+with pdf_col2:
+    st.caption("PDF is a **summary** (no raw JSON dump). Enable samples only if you want them included.")
+
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["📧 Email hygiene", "🏢 Org checks", "👤 Manager checks", "🔎 Raw JSON"])
 
 # Email hygiene
-missing_email_count = int(metrics.get("missing_email_count", metrics.get("missingEmailCount", 0)) or 0)
-duplicate_email_count = int(metrics.get("duplicate_email_count", metrics.get("duplicateEmailCount", 0)) or 0)
+with tab1:
+    left, right = st.columns(2)
 
-# New: Inactive employee and contingent worker counts
-inactive_employee_count = int(metrics.get("inactive_employee_count", metrics.get("inactiveEmployeeCount", 0)) or 0)
-contingent_worker_count = int(metrics.get("contingent_worker_count", metrics.get("contingentWorkerCount", 0)) or 0)
+    missing_rows = m.get("missing_email_sample", []) or []
+    dup_rows = m.get("duplicate_email_sample", []) or []
 
-# KPI row
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Active users", f"{active_users}")
-k2.metric("Missing managers", f"{missing_mgr_count} ({missing_mgr_pct}%)")
-k3.metric("Invalid org", f"{invalid_org_count} ({invalid_org_pct}%)")
-k4.metric("Go-Live Risk Score", f"{risk_score} / 100")
-
-# Email KPIs
-e1, e2 = st.columns(2)
-e1.metric("Missing emails", f"{missing_email_count}")
-e2.metric("Duplicate emails", f"{duplicate_email_count}")
-
-# New: Show inactive employee and contingent worker counts
-c_inactive, c_contingent = st.columns(2)
-c_inactive.metric("Inactive employees", f"{inactive_employee_count}")
-c_contingent.metric("Contingent workers", f"{contingent_worker_count}")
-
-st.header("Drilldowns")
-
-# Org drilldowns
-invalid_org_sample = metrics.get("invalid_org_sample") or metrics.get("invalidOrgSample") or []
-missing_manager_sample = metrics.get("missing_manager_sample") or metrics.get("missingManagerSample") or []
-org_missing_field_counts = metrics.get("org_missing_field_counts") or metrics.get("orgMissingFieldCounts") or {}
-
-c1, c2 = st.columns(2)
-with c1:
-    drilldown_block(
-        "Invalid Org — sample rows",
-        invalid_org_sample,
-        "No invalid-org sample returned (or count is 0).",
-    )
-with c2:
-    drilldown_block(
-        "Missing Manager — sample rows",
-        missing_manager_sample,
-        "No missing-manager sample returned (or count is 0).",
-    )
-
-st.subheader("Which org fields are missing most?")
-if isinstance(org_missing_field_counts, dict) and org_missing_field_counts:
-    # Convert to table-friendly list
-    rows = [{"field": k, "missingCount": v} for k, v in org_missing_field_counts.items()]
-    rows.sort(key=lambda x: x["missingCount"], reverse=True)
-    st.dataframe(rows, use_container_width=True)
-else:
-    st.info("No org field stats returned.")
-
-# Email drilldowns
-st.subheader("Email hygiene — sample rows")
-
-missing_email_sample = metrics.get("missing_email_sample") or metrics.get("missingEmailSample") or []
-duplicate_email_sample = metrics.get("duplicate_email_sample") or metrics.get("duplicateEmailSample") or []
-
-c3, c4 = st.columns(2)
-with c3:
-    drilldown_block(
-        "Missing Email — sample rows",
-        missing_email_sample,
-        "No missing-email sample returned (or count is 0).",
-    )
-    # CSV download button for Missing Email sample
-    if missing_email_sample:
-        df_missing_email = pd.DataFrame(missing_email_sample)
-        csv_buffer = io.StringIO()
-        df_missing_email.to_csv(csv_buffer, index=False)
+    with left:
+        st.subheader("Missing emails (sample)")
+        df = pd.DataFrame(missing_rows)
+        st.dataframe(df, use_container_width=True)
         st.download_button(
-            label="Download Missing Email sample as CSV",
-            data=csv_buffer.getvalue(),
-            file_name="missing_email_sample.csv",
-            mime="text/csv"
+            "Download missing emails CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="missing_emails_sample.csv",
+            mime="text/csv",
         )
-with c4:
-    drilldown_block(
-        "Duplicate Email — sample rows",
-        duplicate_email_sample,
-        "No duplicate-email sample returned (or count is 0).",
+
+    with right:
+        st.subheader("Duplicate emails (sample)")
+        df2 = pd.DataFrame(dup_rows)
+        st.dataframe(df2, use_container_width=True)
+        st.download_button(
+            "Download duplicate emails CSV",
+            data=df2.to_csv(index=False).encode("utf-8"),
+            file_name="duplicate_emails_sample.csv",
+            mime="text/csv",
+        )
+
+# Org checks
+with tab2:
+    st.subheader("Org missing field counts")
+    st.json(m.get("org_missing_field_counts", {}) or {})
+
+    st.subheader("Invalid org sample")
+    inv = pd.DataFrame(m.get("invalid_org_sample", []) or [])
+    st.dataframe(inv, use_container_width=True)
+    st.download_button(
+        "Download invalid org CSV",
+        data=inv.to_csv(index=False).encode("utf-8"),
+        file_name="invalid_org_sample.csv",
+        mime="text/csv",
     )
 
-st.divider()
-st.caption("Tip: Use the sidebar 🤖 box to request new metrics or UI changes without manually editing code.")
+# Manager checks
+with tab3:
+    st.subheader("Missing manager sample")
+    mm = pd.DataFrame(m.get("missing_manager_sample", []) or [])
+    st.dataframe(mm, use_container_width=True)
+    st.download_button(
+        "Download missing managers CSV",
+        data=mm.to_csv(index=False).encode("utf-8"),
+        file_name="missing_manager_sample.csv",
+        mime="text/csv",
+    )
+
+# Raw JSON (for debugging only)
+with tab4:
+    st.warning("Debug view. Avoid sharing publicly if it contains sensitive IDs.")
+    st.json(m)
