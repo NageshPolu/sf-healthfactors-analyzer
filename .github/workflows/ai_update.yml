@@ -8,6 +8,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: read
+  models: read
 
 concurrency:
   group: ai-update-${{ github.repository }}
@@ -33,30 +34,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Connectivity check (OpenAI)
+      - name: Connectivity check (GitHub Models)
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_MODELS_URL: https://models.github.ai/inference/chat/completions
         run: |
           set -e
           echo "DNS:"
-          getent hosts api.openai.com || true
+          getent hosts models.github.ai || true
           echo "TLS/HTTP:"
-          curl -I --connect-timeout 10 --max-time 30 https://api.openai.com/v1 || true
-          echo "Auth test:"
-          curl -sS --retry 6 --retry-all-errors --connect-timeout 10 --max-time 60 \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
-            https://api.openai.com/v1/models | head -c 200 || true
+          curl -I --connect-timeout 10 --max-time 30 https://models.github.ai/ || true
+          echo "Auth check (expected 200/4xx, but NOT connection error):"
+          curl -sS --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"openai/gpt-4.1","messages":[{"role":"user","content":"ping"}]}' \
+            "$GITHUB_MODELS_URL" | head -c 200 || true
 
       - name: Run AI updater
         env:
-          # OpenAI
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: gpt-4.1-mini
-
-          # GitHub token (use built-in)
+          # GitHub token (built-in)
           GITHUB_TOKEN: ${{ github.token }}
 
-          # Issue/repo context
+          # GitHub Models
+          GITHUB_MODELS_URL: https://models.github.ai/inference/chat/completions
+          GITHUB_MODELS_MODEL: openai/gpt-4.1
+
+          # Issue/repo context (optional but handy)
           REPO: ${{ github.repository }}
           OWNER: ${{ github.repository_owner }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
