@@ -75,3 +75,13 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           python tools/ai_update.py
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ github.token }}
+          commit-message: "AI update from issue #${{ github.event.issue.number }}"
+          branch: "ai-update/issue-${{ github.event.issue.number }}"
+          title: "AI update from issue #${{ github.event.issue.number }}"
+          body: |
+            Auto-generated changes from issue #${{ github.event.issue.number }}.
+            Please review before merging.
