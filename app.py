@@ -3,6 +3,8 @@ import json
 import requests
 import streamlit as st
 from datetime import datetime, timezone
+import pandas as pd
+import io
 
 # -----------------------------
 # CONFIG
@@ -167,6 +169,10 @@ risk_score = int(metrics.get("risk_score", metrics.get("riskScore", 0)) or 0)
 missing_email_count = int(metrics.get("missing_email_count", metrics.get("missingEmailCount", 0)) or 0)
 duplicate_email_count = int(metrics.get("duplicate_email_count", metrics.get("duplicateEmailCount", 0)) or 0)
 
+# New: Inactive employee and contingent worker counts
+inactive_employee_count = int(metrics.get("inactive_employee_count", metrics.get("inactiveEmployeeCount", 0)) or 0)
+contingent_worker_count = int(metrics.get("contingent_worker_count", metrics.get("contingentWorkerCount", 0)) or 0)
+
 # KPI row
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Active users", f"{active_users}")
@@ -178,6 +184,11 @@ k4.metric("Go-Live Risk Score", f"{risk_score} / 100")
 e1, e2 = st.columns(2)
 e1.metric("Missing emails", f"{missing_email_count}")
 e2.metric("Duplicate emails", f"{duplicate_email_count}")
+
+# New: Show inactive employee and contingent worker counts
+c_inactive, c_contingent = st.columns(2)
+c_inactive.metric("Inactive employees", f"{inactive_employee_count}")
+c_contingent.metric("Contingent workers", f"{contingent_worker_count}")
 
 st.header("Drilldowns")
 
@@ -222,6 +233,17 @@ with c3:
         missing_email_sample,
         "No missing-email sample returned (or count is 0).",
     )
+    # CSV download button for Missing Email sample
+    if missing_email_sample:
+        df_missing_email = pd.DataFrame(missing_email_sample)
+        csv_buffer = io.StringIO()
+        df_missing_email.to_csv(csv_buffer, index=False)
+        st.download_button(
+            label="Download Missing Email sample as CSV",
+            data=csv_buffer.getvalue(),
+            file_name="missing_email_sample.csv",
+            mime="text/csv"
+        )
 with c4:
     drilldown_block(
         "Duplicate Email — sample rows",
