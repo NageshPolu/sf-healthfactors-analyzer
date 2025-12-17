@@ -68,7 +68,7 @@ def metric_card(label: str, value: Any, help_text: Optional[str] = None):
 # UI
 # -----------------------------
 st.set_page_config(page_title="SuccessFactors EC Go-Live Gates", layout="wide")
-st.title("✅ SuccessFactors EC Health Check")
+st.title("✅ YASH HealthFactors - SAP SuccessFactors EC Health Check")
 
 with st.sidebar:
     st.header("Connection")
