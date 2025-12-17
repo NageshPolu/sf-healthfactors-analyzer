@@ -11,17 +11,15 @@ import pandas as pd
 # Helpers
 # -----------------------------
 def normalize_base_url(u: str) -> str:
-    u = (u or "").strip()
-    return u.rstrip("/") if u else ""
+    u = (u or "").strip().rstrip("/")
+    return u
 
 
 def safe_json(resp: requests.Response) -> Dict[str, Any]:
     try:
         return resp.json()
     except Exception:
-        # never dump huge HTML / stack traces to UI
-        t = (resp.text or "").strip().replace("\n", " ")
-        return {"detail": (t[:300] + ("…" if len(t) > 300 else ""))}
+        return {"detail": (resp.text or "")[:800]}
 
 
 def api_get(url: str, timeout: int = 30) -> Tuple[bool, int, Dict[str, Any]]:
@@ -29,51 +27,24 @@ def api_get(url: str, timeout: int = 30) -> Tuple[bool, int, Dict[str, Any]]:
         r = requests.get(url, timeout=timeout)
         return r.ok, r.status_code, safe_json(r)
     except Exception as e:
-        return False, 0, {"detail": str(e)[:300]}
+        return False, 0, {"detail": str(e)}
 
 
-def api_post(url: str, timeout: int = 120) -> Tuple[bool, int, Dict[str, Any]]:
+def api_post(url: str, timeout: int = 180) -> Tuple[bool, int, Dict[str, Any]]:
     try:
         r = requests.post(url, json={}, timeout=timeout)
         return r.ok, r.status_code, safe_json(r)
     except Exception as e:
-        return False, 0, {"detail": str(e)[:300]}
+        return False, 0, {"detail": str(e)}
 
 
 def as_int(v: Any, default: int = 0) -> int:
     try:
+        if v is None:
+            return default
         return int(v)
     except Exception:
         return default
-
-
-def sanitize_msg(msg: Any) -> str:
-    """
-    Prevent accidental rendering of large objects / stack traces / HTML.
-    """
-    if msg is None:
-        return "Unknown error"
-    s = str(msg)
-    s = s.replace("\n", " ").strip()
-    return s[:240] + ("…" if len(s) > 240 else "")
-
-
-def render_api_error(
-    title: str,
-    http_code: int,
-    payload: Dict[str, Any],
-    *,
-    show_tech: bool,
-    hint: Optional[str] = None,
-):
-    detail = payload.get("detail") or payload.get("message") or "Request failed"
-    st.error(f"{title} (HTTP {http_code}): {sanitize_msg(detail)}")
-    if hint:
-        st.info(hint)
-
-    if show_tech:
-        with st.expander("Show technical details"):
-            st.write({"http_code": http_code, "payload": payload})
 
 
 def show_table(title: str, rows: Any):
@@ -81,24 +52,34 @@ def show_table(title: str, rows: Any):
     if not rows:
         st.info("No sample data available.")
         return
-    try:
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    except Exception:
-        st.info("Sample exists but cannot be rendered as a table.")
-        st.write(rows)
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+
+def show_counts_table(title: str, d: Dict[str, Any]):
+    st.subheader(title)
+    if not d:
+        st.info("No data available.")
+        return
+    df = pd.DataFrame([{"Status": k, "Count": v} for k, v in d.items()])
+    df = df.sort_values("Count", ascending=False)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def metric_card(label: str, value: Any, help_text: Optional[str] = None):
-    v = value if value is not None else 0
-    st.metric(label, v, help=help_text)
+    st.metric(label, value if value is not None else 0, help=help_text)
+
+
+def short_error(msg: str) -> str:
+    # Avoid dumping long blobs into the UI
+    msg = (msg or "").strip()
+    return msg if len(msg) <= 220 else msg[:220] + "..."
 
 
 # -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="SuccessFactors EC Go-Live Gates", layout="wide")
-
 st.title("✅ SuccessFactors EC Go-Live Gates (Streamlit UI + Render API)")
 
 with st.sidebar:
@@ -108,27 +89,21 @@ with st.sidebar:
         "Backend URL",
         value=default_backend,
         placeholder="https://your-render-backend",
-        help="Example: https://sf-ec-gates-backend.onrender.com",
     )
     backend_url = normalize_base_url(backend_url)
 
     st.caption("Streamlit calls Render. Render calls SuccessFactors.")
 
-    st.divider()
-    st.subheader("Refresh")
     auto_refresh = st.toggle("Auto-refresh latest snapshot", value=False)
-    refresh_secs = st.slider("Refresh every (seconds)", 10, 120, 30, disabled=not auto_refresh)
+    refresh_secs = st.slider(
+        "Refresh every (seconds)",
+        10, 180, 30,
+        disabled=not auto_refresh
+    )
 
     st.divider()
-    st.subheader("Display")
-    show_tech_details = st.toggle("Show technical details", value=False)
-    show_raw_json_tab = st.toggle("Show Raw JSON tab", value=True)
-
-    st.divider()
-    st.subheader("PDF export")
-    include_samples_pdf = st.toggle("Include samples in PDF", value=False)
-    st.caption("PDF export wiring is optional; this toggle is reserved for later.")
-
+    st.header("Display")
+    show_raw_json = st.toggle("Show raw JSON (advanced)", value=False)
 
 status_box = st.empty()
 
@@ -136,21 +111,22 @@ if not backend_url:
     status_box.warning("Enter your Render backend URL to continue.")
     st.stop()
 
-# Health check (GET /health)
+# -----------------------------
+# Health check
+# -----------------------------
 ok, code, data = api_get(f"{backend_url}/health", timeout=20)
 if ok:
     status_box.success("Backend reachable ✅")
 else:
-    render_api_error(
-        "Backend not healthy",
-        code,
-        data,
-        show_tech=show_tech_details,
-        hint="Check Render logs. Also confirm your backend exposes GET /health.",
-    )
+    detail = data.get("detail") or data.get("message") or "Backend not reachable"
+    status_box.error(f"Backend not healthy (HTTP {code}): {short_error(detail)}")
+    with st.expander("Show error details"):
+        st.write(detail)
     st.stop()
 
+# -----------------------------
 # Actions
+# -----------------------------
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     run_clicked = st.button("🔄 Run live check now", use_container_width=True)
@@ -159,7 +135,6 @@ with c2:
 with c3:
     st.info("Tip: Use **Run live check now** to pull real-time SF data via Render, then view it below.")
 
-# Run now (POST /run)
 if run_clicked:
     with st.spinner("Running checks via backend..."):
         ok_run, code_run, out = api_post(f"{backend_url}/run", timeout=240)
@@ -167,39 +142,34 @@ if run_clicked:
         st.success("Run completed ✅")
         st.session_state["force_refresh"] = True
     else:
-        render_api_error(
-            "Run failed",
-            code_run,
-            out,
-            show_tech=show_tech_details,
-            hint="If you see HTTP 500, open Render logs — it’s a backend error (often a missing function/field).",
-        )
+        detail = out.get("detail", "Internal error")
+        st.error(f"Run failed (HTTP {code_run}): {short_error(detail)}")
+        with st.expander("Show error details"):
+            st.write(detail)
 
 if refresh_clicked:
     st.session_state["force_refresh"] = True
 
-# Auto-refresh tick (no loops)
+# Auto refresh (simple tick)
 if auto_refresh:
     now_ts = time.time()
-    last = st.session_state.get("last_refresh_ts", 0.0)
+    last = st.session_state.get("last_refresh_ts", 0)
     if (now_ts - last) > refresh_secs:
         st.session_state["force_refresh"] = True
         st.session_state["last_refresh_ts"] = now_ts
 
-# Fetch latest snapshot (GET /metrics/latest)
-# If force_refresh is set, clear it after attempt (so it doesn't keep triggering)
+# -----------------------------
+# Load latest metrics
+# -----------------------------
 if st.session_state.get("force_refresh"):
     st.session_state["force_refresh"] = False
 
 ok_m, code_m, payload = api_get(f"{backend_url}/metrics/latest", timeout=30)
 if not ok_m:
-    render_api_error(
-        "Could not fetch latest snapshot",
-        code_m,
-        payload,
-        show_tech=show_tech_details,
-        hint="Confirm your backend exposes GET /metrics/latest and returns JSON.",
-    )
+    detail = payload.get("detail", "Error")
+    st.error(f"Could not fetch latest snapshot (HTTP {code_m}): {short_error(detail)}")
+    with st.expander("Show error details"):
+        st.write(detail)
     st.stop()
 
 if payload.get("status") == "empty":
@@ -209,58 +179,69 @@ if payload.get("status") == "empty":
 metrics = payload.get("metrics") or {}
 snapshot_time = metrics.get("snapshot_time_utc", "unknown")
 
+# -----------------------------
 # KPI row
+# -----------------------------
+active_users = as_int(metrics.get("active_users"))
+empjob_rows = as_int(metrics.get("empjob_rows") or metrics.get("current_empjob_rows"))
+inactive_users = as_int(metrics.get("inactive_users") or metrics.get("inactive_user_count"))
+contingent_workers = as_int(metrics.get("contingent_workers") or metrics.get("contingent_worker_count"))
+contingent_active = as_int(metrics.get("contingent_workers_active"))
+
+missing_mgr = as_int(metrics.get("missing_manager_count"))
+invalid_org = as_int(metrics.get("invalid_org_count"))
+missing_email = as_int(metrics.get("missing_email_count"))
+risk_score = as_int(metrics.get("risk_score"))
+
 k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
 with k1:
-    metric_card("Active users", as_int(metrics.get("active_users")), help_text="Should be based on EmpJob employee status in backend.")
+    metric_card("Active users", active_users, help_text="Based on EmpJob employee status (not User.status).")
 with k2:
-    metric_card("EmpJob rows", as_int(metrics.get("empjob_rows") or metrics.get("current_empjob_rows")))
+    metric_card("EmpJob rows", empjob_rows, help_text="All latest EmpJob rows (effectiveLatestChange=true).")
 with k3:
-    metric_card(
-        "Contingent workers",
-        as_int(metrics.get("contingent_workers")),
-        help_text=metrics.get("contingent_source") or "Backend determines source (prefer EmpEmployment.isContingentWorker).",
-    )
+    metric_card("Contingent workers", contingent_workers, help_text=f"Active contingent: {contingent_active}")
 with k4:
-    metric_card(
-        "Inactive users",
-        as_int(metrics.get("inactive_users")),
-        help_text=metrics.get("employee_status_source") or "Backend determines source (prefer EmpJob.emplStatus).",
-    )
+    metric_card("Inactive users", inactive_users, help_text="Based on EmpJob employee status.")
 with k5:
-    metric_card("Missing managers", as_int(metrics.get("missing_manager_count")))
+    metric_card("Missing managers", missing_mgr)
 with k6:
-    metric_card("Invalid org", as_int(metrics.get("invalid_org_count")))
+    metric_card("Invalid org", invalid_org)
 with k7:
-    metric_card("Missing emails", as_int(metrics.get("missing_email_count")), help_text="Calculated for active population in backend.")
+    metric_card("Missing emails", missing_email, help_text="Email hygiene checked for ACTIVE employees.")
 with k8:
-    metric_card("Risk score", as_int(metrics.get("risk_score")))
+    metric_card("Risk score", risk_score)
 
 st.caption(f"Snapshot UTC: {snapshot_time}")
 
-# Tabs
-tabs = ["📧 Email hygiene", "🧩 Org checks", "👤 Workforce", "👥 Manager checks"]
-if show_raw_json_tab:
-    tabs.append("🔎 Raw JSON")
+# Useful metadata (not code)
+meta1, meta2, meta3 = st.columns(3)
+with meta1:
+    st.caption(f"Employee status source: {metrics.get('employee_status_source','-')}")
+with meta2:
+    st.caption(f"Contingent source: {metrics.get('contingent_source','-')}")
+with meta3:
+    st.caption("Samples are capped (default 200).")
 
-tab_objs = st.tabs(tabs)
+# Guardrails (helps catch stale snapshots / backend mismatch)
+if missing_email > 0 and not metrics.get("missing_email_sample"):
+    st.warning("Missing emails count > 0 but sample is empty. Run **Run live check now** again after backend deploy.")
+if inactive_users > 0 and not metrics.get("inactive_users_sample"):
+    st.warning("Inactive users count > 0 but sample is empty. Run **Run live check now** again after backend deploy.")
+if contingent_workers > 0 and not metrics.get("contingent_workers_sample"):
+    st.warning("Contingent workers count > 0 but sample is empty. Run **Run live check now** again after backend deploy.")
 
-# 1) Email hygiene
-with tab_objs[0]:
-    missing_cnt = as_int(metrics.get("missing_email_count"))
-    missing_sample = metrics.get("missing_email_sample") or []
+# -----------------------------
+# Tabs (NO CODE shown)
+# -----------------------------
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "👥 Workforce"]
+)
 
-    if missing_cnt > 0 and not missing_sample:
-        st.warning(
-            "Missing emails count is > 0, but sample is empty. "
-            "That means the backend did not send sample rows (or is filtering incorrectly)."
-        )
-
-    show_table("Missing emails (sample)", missing_sample)
+with tab1:
+    show_table("Missing emails (sample)", metrics.get("missing_email_sample"))
     show_table("Duplicate emails (sample)", metrics.get("duplicate_email_sample"))
 
-# 2) Org checks
-with tab_objs[1]:
+with tab2:
     show_table("Invalid org assignments (sample)", metrics.get("invalid_org_sample"))
     st.subheader("Missing org field counts")
     counts = metrics.get("org_missing_field_counts") or {}
@@ -269,46 +250,15 @@ with tab_objs[1]:
     else:
         st.info("No org missing-field breakdown available.")
 
-# 3) Workforce (inactive + contingent)
-with tab_objs[2]:
-    cA, cB, cC = st.columns([1, 1, 2])
-    with cA:
-        metric_card("Inactive users", as_int(metrics.get("inactive_users")))
-    with cB:
-        metric_card("Contingent workers", as_int(metrics.get("contingent_workers")))
-    with cC:
-        ca = metrics.get("contingent_workers_active")
-        if ca is not None:
-            st.info(f"Contingent workers (active): **{as_int(ca)}**")
-        else:
-            st.caption("Optional: backend can return contingent_workers_active.")
+with tab3:
+    show_table("Missing managers (sample)", metrics.get("missing_manager_sample"))
 
-    st.divider()
-
-    # Breakdown by employee status (if backend provides it)
-    by_status = metrics.get("inactive_users_by_status")
-    if isinstance(by_status, dict) and by_status:
-        st.subheader("Inactive users by Employee Status")
-        df = pd.DataFrame(
-            [{"Employee Status": k, "Count": as_int(v)} for k, v in by_status.items()]
-        ).sort_values("Count", ascending=False)
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    else:
-        st.info(
-            "Inactive-by-status breakdown not available. "
-            "Backend should return inactive_users_by_status (from EmpJob employee status)."
-        )
-
-    st.divider()
+with tab4:
+    show_counts_table("Inactive users by employee status", metrics.get("inactive_users_by_status") or {})
     show_table("Inactive users (sample)", metrics.get("inactive_users_sample"))
     show_table("Contingent workers (sample)", metrics.get("contingent_workers_sample"))
 
-# 4) Manager checks
-with tab_objs[3]:
-    show_table("Missing managers (sample)", metrics.get("missing_manager_sample"))
-
-# 5) Raw JSON (optional)
-if show_raw_json_tab:
-    with tab_objs[-1]:
-        st.caption("This is the raw metrics payload returned by the backend.")
-        st.json(metrics)
+if show_raw_json:
+    st.divider()
+    st.subheader("Raw JSON (advanced)")
+    st.json(metrics)
