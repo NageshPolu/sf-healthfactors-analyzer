@@ -1,425 +1,198 @@
-import io
+import os
 import json
 import time
-from datetime import datetime, timezone
+from typing import Any, Dict, Tuple, Optional
 
-import pandas as pd
 import requests
 import streamlit as st
-
-# -----------------------------
-# Config
-# -----------------------------
-DEFAULT_BACKEND_URL = (
-    st.secrets.get("BACKEND_URL", None) if hasattr(st, "secrets") else None
-) or "https://your-render-backend.onrender.com"
-
-REQUEST_TIMEOUT = 60
+import pandas as pd
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
-def _safe_int(x, default=0) -> int:
+def normalize_base_url(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return ""
+    u = u.rstrip("/")
+    return u
+
+
+def safe_json(resp: requests.Response) -> Dict[str, Any]:
     try:
-        if x is None:
-            return default
-        return int(x)
+        return resp.json()
+    except Exception:
+        return {"detail": resp.text[:500]}
+
+
+def api_get(url: str, timeout: int = 30) -> Tuple[bool, int, Dict[str, Any]]:
+    try:
+        r = requests.get(url, timeout=timeout)
+        return r.ok, r.status_code, safe_json(r)
+    except Exception as e:
+        return False, 0, {"detail": str(e)}
+
+
+def api_post(url: str, timeout: int = 120) -> Tuple[bool, int, Dict[str, Any]]:
+    try:
+        r = requests.post(url, json={}, timeout=timeout)
+        return r.ok, r.status_code, safe_json(r)
+    except Exception as e:
+        return False, 0, {"detail": str(e)}
+
+
+def as_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
     except Exception:
         return default
 
 
-def _safe_list(x):
-    return x if isinstance(x, list) else []
+def show_table(title: str, rows: Any):
+    st.subheader(title)
+    if not rows:
+        st.info("No sample data available.")
+        return
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
-def _safe_dict(x):
-    return x if isinstance(x, dict) else {}
-
-
-def _fmt_ts(ts: str) -> str:
-    if not ts:
-        return "-"
-    try:
-        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    except Exception:
-        return ts
-
-
-def api_health(base_url: str) -> tuple[bool, str]:
-    try:
-        r = requests.get(f"{base_url.rstrip('/')}/health", timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            return True, "Backend reachable ✅"
-        return False, f"Backend not healthy (HTTP {r.status_code})"
-    except Exception as e:
-        return False, f"Backend unreachable ❌ ({e})"
-
-
-def api_run_now(base_url: str) -> tuple[bool, str]:
-    try:
-        r = requests.post(f"{base_url.rstrip('/')}/run", timeout=REQUEST_TIMEOUT)
-        if r.status_code == 200:
-            data = r.json() if "application/json" in (r.headers.get("content-type", "") or "") else {}
-            ts = data.get("snapshot_time_utc") or ""
-            return True, f"Run complete ✅ ({_fmt_ts(ts)})"
-        return False, f"Run failed (HTTP {r.status_code}): {r.text[:200]}"
-    except Exception as e:
-        return False, f"Run failed ❌ ({e})"
-
-
-def api_latest(base_url: str) -> tuple[bool, dict | None, str]:
-    try:
-        r = requests.get(f"{base_url.rstrip('/')}/metrics/latest", timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            return False, None, f"Fetch failed (HTTP {r.status_code}): {r.text[:200]}"
-        data = r.json()
-        if data.get("status") == "empty":
-            return False, None, "No snapshots yet. Click **Run live check now**."
-        metrics = data.get("metrics") or {}
-        return True, metrics, "Latest snapshot loaded ✅"
-    except Exception as e:
-        return False, None, f"Fetch failed ❌ ({e})"
-
-
-def compute_risk_score(metrics: dict) -> int:
-    # Prefer backend score if present
-    if isinstance(metrics, dict) and "risk_score" in metrics:
-        return _safe_int(metrics.get("risk_score"), 0)
-
-    # Fallback (older payloads)
-    mm = _safe_int(metrics.get("missing_manager_count") or metrics.get("missing_managers"), 0)
-    inv = _safe_int(metrics.get("invalid_org_count") or metrics.get("invalid_org"), 0)
-    me = _safe_int(metrics.get("missing_email_count") or metrics.get("missing_emails"), 0)
-    iu = _safe_int(metrics.get("inactive_users") or metrics.get("inactive_user_count"), 0)
-
-    score = (mm * 2) + (inv * 1) + (me * 1) + (iu * 1)
-    return int(score)
-
-
-def metrics_kpis(metrics: dict) -> dict:
-    """
-    Normalize backend keys to UI keys.
-    Supports both your current gates.py naming and older variants.
-    """
-    m = _safe_dict(metrics)
-
-    active_users = _safe_int(m.get("active_users") or m.get("users_active"))
-    empjob_rows = _safe_int(
-        m.get("empjob_rows")
-        or m.get("current_empjob_rows")
-        or m.get("empJob_rows")
-        or m.get("empjob_count")
-    )
-
-    missing_managers = _safe_int(m.get("missing_manager_count") or m.get("missing_managers"))
-    invalid_org = _safe_int(
-        m.get("invalid_org_count")
-        or m.get("invalid_org")
-        or m.get("invalid_org_assignments")
-    )
-    missing_emails = _safe_int(m.get("missing_email_count") or m.get("missing_emails"))
-
-    # NEW KPIs
-    contingent_workers = _safe_int(m.get("contingent_workers") or m.get("contingent_worker_count"))
-    inactive_users = _safe_int(m.get("inactive_users") or m.get("inactive_user_count") or m.get("users_inactive"))
-
-    snapshot_time_utc = (m.get("snapshot_time_utc") or m.get("snapshotTimeUtc") or "")
-
-    return {
-        "active_users": active_users,
-        "empjob_rows": empjob_rows,
-        "missing_managers": missing_managers,
-        "invalid_org": invalid_org,
-        "missing_emails": missing_emails,
-        "contingent_workers": contingent_workers,
-        "inactive_users": inactive_users,
-        "snapshot_time_utc": snapshot_time_utc,
-        "raw": m,
-    }
-
-
-def _pick_sample(raw: dict, *keys: str) -> list:
-    for k in keys:
-        v = raw.get(k)
-        if isinstance(v, list):
-            return v
-    return []
-
-
-def build_pdf_summary(metrics: dict, include_samples: bool) -> bytes:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-
-    k = metrics_kpis(metrics)
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
-
-    y = h - 48
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(40, y, "SuccessFactors EC Go-Live Gates — Summary")
-    y -= 18
-
-    c.setFont("Helvetica", 10)
-    c.drawString(40, y, f"Snapshot: {_fmt_ts(k['snapshot_time_utc'])}")
-    y -= 22
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(40, y, "KPIs")
-    y -= 14
-
-    c.setFont("Helvetica", 10)
-    rows = [
-        ("Active users", k["active_users"]),
-        ("EmpJob rows", k["empjob_rows"]),
-        ("Contingent workers", k["contingent_workers"]),
-        ("Inactive users", k["inactive_users"]),
-        ("Missing managers", k["missing_managers"]),
-        ("Invalid org assignments", k["invalid_org"]),
-        ("Missing emails", k["missing_emails"]),
-        ("Risk score", compute_risk_score(k["raw"])),
-    ]
-
-    for label, val in rows:
-        c.drawString(50, y, f"- {label}: {val}")
-        y -= 13
-        if y < 80:
-            c.showPage()
-            y = h - 48
-            c.setFont("Helvetica", 10)
-
-    if include_samples:
-        raw = k["raw"]
-
-        def dump_sample(title, items):
-            nonlocal y
-            items = _safe_list(items)
-            c.setFont("Helvetica-Bold", 11)
-            c.drawString(40, y, title)
-            y -= 14
-            c.setFont("Helvetica", 9)
-            if not items:
-                c.drawString(50, y, "(no sample data available)")
-                y -= 12
-                return
-            for it in items[:25]:
-                line = str(it)
-                if len(line) > 120:
-                    line = line[:117] + "..."
-                c.drawString(50, y, f"- {line}")
-                y -= 11
-                if y < 80:
-                    c.showPage()
-                    y = h - 48
-                    c.setFont("Helvetica", 9)
-
-        dump_sample(
-            "Missing emails (sample)",
-            _pick_sample(raw, "missing_email_sample", "missing_emails_sample", "missingEmailsSample"),
-        )
-        dump_sample(
-            "Duplicate emails (sample)",
-            _pick_sample(raw, "duplicate_email_sample", "duplicate_emails_sample", "duplicateEmailsSample"),
-        )
-        dump_sample(
-            "Missing managers (sample)",
-            _pick_sample(raw, "missing_manager_sample", "missing_managers_sample", "missingManagersSample"),
-        )
-        dump_sample(
-            "Invalid org assignments (sample)",
-            _pick_sample(raw, "invalid_org_sample", "invalidOrgSample"),
-        )
-        dump_sample(
-            "Inactive users (sample)",
-            _pick_sample(raw, "inactive_users_sample", "inactiveUsersSample"),
-        )
-        dump_sample(
-            "Contingent workers (sample)",
-            _pick_sample(raw, "contingent_workers_sample", "contingentWorkersSample"),
-        )
-
-    c.showPage()
-    c.save()
-    return buf.getvalue()
+def metric_card(label: str, value: Any, help_text: Optional[str] = None):
+    v = value if value is not None else 0
+    st.metric(label, v, help=help_text)
 
 
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.set_page_config(page_title="SuccessFactors EC Go-Live Gates", layout="wide")
+
 st.title("✅ SuccessFactors EC Go-Live Gates (Streamlit UI + Render API)")
 
 with st.sidebar:
     st.header("Connection")
-    backend_url = st.text_input(
-        "Backend URL",
-        value=st.session_state.get("backend_url", DEFAULT_BACKEND_URL),
-    )
-    st.session_state["backend_url"] = backend_url
+    default_backend = os.getenv("BACKEND_URL") or ""
+    backend_url = st.text_input("Backend URL", value=default_backend, placeholder="https://your-render-backend")
 
-    ok, msg = api_health(backend_url)
-    # IMPORTANT: avoid Streamlit "magic" by not using ternary expression statements
-    if ok:
-        st.success(msg)
-    else:
-        st.error(msg)
+    backend_url = normalize_base_url(backend_url)
 
     st.caption("Streamlit calls Render. Render calls SuccessFactors.")
 
-    st.divider()
-    auto_refresh = st.toggle("Auto-refresh latest snapshot", value=st.session_state.get("auto_refresh", False))
-    st.session_state["auto_refresh"] = auto_refresh
-    refresh_seconds = st.slider("Refresh every (seconds)", 10, 120, 30, step=5, disabled=not auto_refresh)
+    auto_refresh = st.toggle("Auto-refresh latest snapshot", value=False)
+    refresh_secs = st.slider("Refresh every (seconds)", 10, 120, 30, disabled=not auto_refresh)
 
     st.divider()
     st.header("PDF export")
-    include_samples = st.toggle("Include samples in PDF", value=st.session_state.get("include_samples", False))
-    st.session_state["include_samples"] = include_samples
+    include_samples_pdf = st.toggle("Include samples in PDF", value=False)
 
-# State
-if "latest_metrics" not in st.session_state:
-    st.session_state["latest_metrics"] = None
-if "prev_metrics" not in st.session_state:
-    st.session_state["prev_metrics"] = None
+# Status banner
+status_box = st.empty()
 
-status_placeholder = st.empty()
-
-# Actions row
-col_a, col_b, col_c = st.columns([1.2, 1.2, 2.6])
-
-with col_a:
-    if st.button("🔄 Run live check now", use_container_width=True):
-        ok_run, msg_run = api_run_now(backend_url)
-        if ok_run:
-            status_placeholder.success(msg_run)
-        else:
-            status_placeholder.error(msg_run)
-
-        ok_latest, metrics, msg_latest = api_latest(backend_url)
-        if ok_latest:
-            st.session_state["prev_metrics"] = st.session_state["latest_metrics"]
-            st.session_state["latest_metrics"] = metrics
-            status_placeholder.success("Latest snapshot updated ✅")
-        else:
-            status_placeholder.warning(msg_latest)
-
-with col_b:
-    if st.button("🧾 Refresh latest snapshot", use_container_width=True):
-        ok_latest, metrics, msg_latest = api_latest(backend_url)
-        if ok_latest:
-            st.session_state["prev_metrics"] = st.session_state["latest_metrics"]
-            st.session_state["latest_metrics"] = metrics
-            status_placeholder.success(msg_latest)
-        else:
-            status_placeholder.warning(msg_latest)
-
-with col_c:
-    st.info("Tip: Use **Run live check now** to pull real-time SF data via Render, then view it below.")
-
-# Auto refresh
-if auto_refresh:
-    time.sleep(0.2)
-    if st.session_state["latest_metrics"] is not None:
-        now_t = time.time()
-        last = st.session_state.get("_last_refresh", 0.0)
-        if now_t - last >= float(refresh_seconds):
-            ok_latest, metrics, _ = api_latest(backend_url)
-            if ok_latest:
-                st.session_state["prev_metrics"] = st.session_state["latest_metrics"]
-                st.session_state["latest_metrics"] = metrics
-            st.session_state["_last_refresh"] = now_t
-
-metrics = st.session_state["latest_metrics"]
-if not metrics:
-    st.warning("No snapshot loaded yet. Click **Run live check now**.")
+if not backend_url:
+    status_box.warning("Enter your Render backend URL to continue.")
     st.stop()
 
-k = metrics_kpis(metrics)
-prev = metrics_kpis(st.session_state["prev_metrics"]) if st.session_state["prev_metrics"] else None
+# Health check
+ok, code, data = api_get(f"{backend_url}/health", timeout=20)
+if ok:
+    status_box.success("Backend reachable ✅")
+else:
+    msg = data.get("detail") or data.get("message") or "Backend not reachable"
+    status_box.error(f"Backend not healthy (HTTP {code}): {msg}")
+    st.stop()
 
-# KPI Row (8 tiles)
-kpi_cols = st.columns(8)
-kpi_cols[0].metric("Active users", k["active_users"])
-kpi_cols[1].metric("EmpJob rows", k["empjob_rows"])
-kpi_cols[2].metric("Contingent workers", k["contingent_workers"])
-kpi_cols[3].metric("Inactive users", k["inactive_users"])
+# Actions row
+c1, c2, c3 = st.columns([1, 1, 2])
+with c1:
+    run_clicked = st.button("🔄 Run live check now", use_container_width=True)
+with c2:
+    refresh_clicked = st.button("🧾 Refresh latest snapshot", use_container_width=True)
+with c3:
+    st.info("Tip: Use **Run live check now** to pull real-time SF data via Render, then view it below.")
 
-def _delta(curr_key: str) -> str | None:
-    if not prev:
-        return None
-    return str(k[curr_key] - prev[curr_key])
+# Run now
+if run_clicked:
+    with st.spinner("Running checks via backend..."):
+        ok_run, code_run, out = api_post(f"{backend_url}/run", timeout=240)
+    if ok_run:
+        st.success("Run completed ✅")
+    else:
+        st.error(f"Run failed (HTTP {code_run}): {out.get('detail','Internal error')}")
 
-kpi_cols[4].metric("Missing managers", k["missing_managers"], delta=_delta("missing_managers"))
-kpi_cols[5].metric("Invalid org", k["invalid_org"], delta=_delta("invalid_org"))
-kpi_cols[6].metric("Missing emails", k["missing_emails"])
-kpi_cols[7].metric("Risk score", compute_risk_score(k["raw"]))
+# Always refresh snapshot after a run, or on refresh button
+if run_clicked or refresh_clicked:
+    st.session_state["force_refresh"] = True
 
-st.caption(f"Snapshot UTC: {_fmt_ts(k['snapshot_time_utc'])}")
+# Auto-refresh loop
+if auto_refresh:
+    # simple timer tick (no infinite loops)
+    now = time.time()
+    last = st.session_state.get("last_refresh_ts", 0)
+    if (now - last) > refresh_secs:
+        st.session_state["force_refresh"] = True
+        st.session_state["last_refresh_ts"] = now
 
-# PDF download
-pdf_bytes = build_pdf_summary(k["raw"], include_samples=include_samples)
-st.download_button(
-    "⬇️ Download PDF summary",
-    data=pdf_bytes,
-    file_name="sf_ec_gates_summary.pdf",
-    mime="application/pdf",
-    help="PDF is a summary (no raw JSON dump). Enable samples only if you want them included.",
-)
+# Load latest metrics
+if st.session_state.get("force_refresh"):
+    st.session_state["force_refresh"] = False
 
-# Tabs (NO raw-json/code tab)
-tab1, tab2, tab3 = st.tabs(["📧 Email hygiene", "🗂️ Org checks", "👤 Manager checks"])
+ok_m, code_m, payload = api_get(f"{backend_url}/metrics/latest", timeout=30)
+if not ok_m:
+    st.error(f"Could not fetch latest snapshot (HTTP {code_m}): {payload.get('detail','Error')}")
+    st.stop()
 
-raw = k["raw"]
+if payload.get("status") == "empty":
+    st.warning("No snapshots found yet. Click **Run live check now**.")
+    st.stop()
+
+metrics = payload.get("metrics") or {}
+snapshot_time = metrics.get("snapshot_time_utc", "unknown")
+
+# KPI row
+k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
+
+with k1:
+    metric_card("Active users", as_int(metrics.get("active_users")))
+with k2:
+    metric_card("EmpJob rows", as_int(metrics.get("empjob_rows") or metrics.get("current_empjob_rows")))
+with k3:
+    metric_card("Contingent workers", as_int(metrics.get("contingent_workers")))
+with k4:
+    metric_card("Inactive users", as_int(metrics.get("inactive_users")))
+with k5:
+    metric_card("Missing managers", as_int(metrics.get("missing_manager_count")))
+with k6:
+    metric_card("Invalid org", as_int(metrics.get("invalid_org_count")))
+with k7:
+    metric_card("Missing emails", as_int(metrics.get("missing_email_count")))
+with k8:
+    metric_card("Risk score", as_int(metrics.get("risk_score")))
+
+st.caption(f"Snapshot UTC: {snapshot_time}")
+
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs(["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "🔎 Raw JSON"])
 
 with tab1:
-    st.subheader("Missing emails (sample)")
-    missing_emails_sample = _pick_sample(raw, "missing_email_sample", "missing_emails_sample", "missingEmailsSample")
-    df1 = pd.DataFrame(_safe_list(missing_emails_sample))
-    if df1.empty:
-        st.info("No sample data available.")
-    else:
-        st.dataframe(df1, use_container_width=True)
-
-    st.subheader("Duplicate emails (sample)")
-    dup_emails_sample = _pick_sample(raw, "duplicate_email_sample", "duplicate_emails_sample", "duplicateEmailsSample")
-    df2 = pd.DataFrame(_safe_list(dup_emails_sample))
-    if df2.empty:
-        st.info("No sample data available.")
-    else:
-        st.dataframe(df2, use_container_width=True)
+    show_table("Missing emails (sample)", metrics.get("missing_email_sample"))
+    show_table("Duplicate emails (sample)", metrics.get("duplicate_email_sample"))
 
 with tab2:
-    st.subheader("Invalid org assignments (sample)")
-    invalid_org_sample = _pick_sample(raw, "invalid_org_sample", "invalidOrgSample")
-    df = pd.DataFrame(_safe_list(invalid_org_sample))
-    if df.empty:
-        st.info("No sample data available.")
+    show_table("Invalid org assignments (sample)", metrics.get("invalid_org_sample"))
+    st.subheader("Missing org field counts")
+    counts = metrics.get("org_missing_field_counts") or {}
+    if counts:
+        st.dataframe(pd.DataFrame([counts]), use_container_width=True, hide_index=True)
     else:
-        st.dataframe(df, use_container_width=True)
+        st.info("No org missing-field breakdown available.")
 
 with tab3:
-    st.subheader("Missing managers (sample)")
-    missing_mgr_sample = _pick_sample(raw, "missing_manager_sample", "missing_managers_sample", "missingManagersSample")
-    df = pd.DataFrame(_safe_list(missing_mgr_sample))
-    if df.empty:
-        st.info("No sample data available.")
-    else:
-        st.dataframe(df, use_container_width=True)
+    show_table("Missing managers (sample)", metrics.get("missing_manager_sample"))
+    show_table("Inactive users (sample)", metrics.get("inactive_users_sample"))
+    show_table("Contingent workers (sample)", metrics.get("contingent_workers_sample"))
 
-    st.subheader("Inactive users (sample)")
-    inactive_sample = _pick_sample(raw, "inactive_users_sample", "inactiveUsersSample")
-    df = pd.DataFrame(_safe_list(inactive_sample))
-    if df.empty:
-        st.info("No sample data available.")
-    else:
-        st.dataframe(df, use_container_width=True)
+with tab4:
+    st.json(metrics)
 
-    st.subheader("Contingent workers (sample)")
-    cw_sample = _pick_sample(raw, "contingent_workers_sample", "contingentWorkersSample")
-    df = pd.DataFrame(_safe_list(cw_sample))
-    if df.empty:
-        st.info("No sample data available.")
-    else:
-        st.dataframe(df, use_container_width=True)
+# NOTE: PDF export can be added here if you want; keeping UI clean (no debug output).
