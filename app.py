@@ -1,11 +1,10 @@
 # app.py
 from __future__ import annotations
 
-import json
-import time
+import os
+import re
 from urllib.parse import urlparse
 
-import pandas as pd
 import requests
 import streamlit as st
 
@@ -17,360 +16,311 @@ def normalize_url(u: str) -> str:
     u = (u or "").strip()
     if not u:
         return ""
+    # Add scheme if missing
+    if not re.match(r"^https?://", u, flags=re.I):
+        u = "https://" + u
     return u.rstrip("/")
 
 
 def derive_api_base_from_instance(instance_url: str) -> str:
     """
-    Best-effort derivation.
-    Typical:
-      https://hcm41.sapsf.com           -> https://api41.sapsf.com
-      https://hcm41preview.sapsf.com    -> https://api41preview.sapsf.com
-    If it can't derive confidently, returns the instance host as-is (user can override).
+    Best-effort mapping:
+      - https://hcm41.sapsf.com      -> https://api41.sapsf.com
+      - https://hcm41preview.sapsf.com -> https://api41preview.sapsf.com
+      - https://salesdemo2.successfactors.eu -> https://apisalesdemo2.successfactors.eu
+      - https://apisalesdemo2.successfactors.eu -> https://apisalesdemo2.successfactors.eu
     """
     instance_url = normalize_url(instance_url)
     if not instance_url:
         return ""
 
-    try:
-        p = urlparse(instance_url if "://" in instance_url else f"https://{instance_url}")
-        host = (p.netloc or "").lower()
-        if not host:
-            return ""
-
-        # If already api*
-        if host.startswith("api"):
-            return f"https://{host}"
-
-        # If hcm* => replace leading "hcm" with "api"
-        if host.startswith("hcm"):
-            return f"https://api{host[3:]}"  # swap prefix only
-
-        # Fallback: if they typed a non-hcm instance, return same host
-        return f"https://{host}"
-    except Exception:
+    p = urlparse(instance_url)
+    host = (p.netloc or "").lower()
+    if not host:
         return ""
 
+    # If already an API host
+    if host.startswith("api"):
+        return f"{p.scheme}://{host}"
 
-def safe_get(d: dict, key: str, default=None):
-    if not isinstance(d, dict):
-        return default
-    return d.get(key, default)
+    # Common SAPSF naming: hcmXX... -> apiXX...
+    if host.startswith("hcm"):
+        api_host = "api" + host[3:]  # replace leading "hcm" with "api"
+        return f"{p.scheme}://{api_host}"
 
-
-def backend_health(backend_url: str) -> tuple[bool, str]:
-    backend_url = normalize_url(backend_url)
-    if not backend_url:
-        return False, "Backend URL missing"
-
-    try:
-        r = requests.get(f"{backend_url}/health", timeout=10)
-        if r.status_code == 200:
-            return True, "Backend reachable ✅"
-        return False, f"Backend not healthy (HTTP {r.status_code})"
-    except Exception as e:
-        return False, f"Backend not reachable: {e}"
+    # SuccessFactors DC style: <tenant>.successfactors.<tld> -> api<tenant>.successfactors.<tld>
+    # e.g. salesdemo2.successfactors.eu -> apisalesdemo2.successfactors.eu
+    api_host = "api" + host
+    return f"{p.scheme}://{api_host}"
 
 
-def call_run(
-    backend_url: str,
-    instance_url: str,
-    api_base_url: str,
-    username: str,
-    password: str,
-    company_id: str | None,
-    timeout_s: int | None,
-    verify_ssl: bool | None,
-) -> dict:
-    payload = {
-        "instance_url": normalize_url(instance_url),
-        "api_base_url": normalize_url(api_base_url),
-        "username": (username or "").strip(),
-        "password": password or "",
-        "company_id": (company_id or "").strip() or None,
-        "timeout": timeout_s,
-        "verify_ssl": verify_ssl,
-    }
-    r = requests.post(f"{normalize_url(backend_url)}/run", json=payload, timeout=120)
-    if r.status_code >= 400:
-        # FastAPI returns {"detail": "..."} usually
-        try:
-            j = r.json()
-            detail = j.get("detail") or r.text
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"HTTP {r.status_code}: {detail}")
+def backend_get(backend_url: str, path: str, params: dict | None = None, timeout: int = 60) -> dict:
+    url = normalize_url(backend_url) + path
+    r = requests.get(url, params=params or {}, timeout=timeout)
+    r.raise_for_status()
     return r.json()
 
 
-def call_latest(backend_url: str, instance_url: str, company_id: str | None) -> dict:
-    params = {}
-    if normalize_url(instance_url):
-        params["instance_url"] = normalize_url(instance_url)
-    if (company_id or "").strip():
-        params["company_id"] = (company_id or "").strip()
-
-    r = requests.get(f"{normalize_url(backend_url)}/metrics/latest", params=params, timeout=30)
-    if r.status_code >= 400:
-        try:
-            j = r.json()
-            detail = j.get("detail") or r.text
-        except Exception:
-            detail = r.text
-        raise RuntimeError(f"HTTP {r.status_code}: {detail}")
+def backend_post(backend_url: str, path: str, payload: dict, timeout: int = 180) -> dict:
+    url = normalize_url(backend_url) + path
+    r = requests.post(url, json=payload, timeout=timeout)
+    # backend returns HTTPException detail as JSON body; Streamlit will show in error block below
+    r.raise_for_status()
     return r.json()
 
 
-def render_kpis(metrics: dict):
-    cols = st.columns(8)
-    cols[0].metric("Active users", safe_get(metrics, "active_users", 0))
-    cols[1].metric("EmpJob rows", safe_get(metrics, "empjob_rows", 0))
-    cols[2].metric("Contingent workers", safe_get(metrics, "contingent_workers", 0))
-    cols[3].metric("Inactive users", safe_get(metrics, "inactive_users", 0))
-    cols[4].metric("Missing managers", safe_get(metrics, "missing_managers", 0))
-    cols[5].metric("Invalid org", safe_get(metrics, "invalid_org", 0))
-    cols[6].metric("Missing emails", safe_get(metrics, "missing_emails", 0))
-    cols[7].metric("Risk score", safe_get(metrics, "risk_score", 0))
-
-    st.caption(f"Snapshot UTC: {safe_get(metrics, 'snapshot_time_utc', 'unknown')}")
-    inst = safe_get(metrics, "instance_url", "")
-    api = safe_get(metrics, "api_base_url", "")
-    comp = safe_get(metrics, "company_id", "")
-    st.caption(f"Instance: {inst or '—'}  |  API base: {api or '—'}  |  Company: {comp or '—'}")
-
-    st.caption(
-        f"Employee status source: {safe_get(metrics, 'employee_status_source', 'unknown')} "
-        f"• Contingent source: {safe_get(metrics, 'contingent_source', 'unknown')}"
-    )
+def safe_list(x) -> list:
+    return x if isinstance(x, list) else []
 
 
-def render_table(sample: list[dict], title: str):
+def render_table(title: str, rows: list[dict], max_rows: int = 50):
     st.subheader(title)
-    if not sample:
+    if not rows:
         st.info("No sample data available.")
         return
-    df = pd.DataFrame(sample)
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.dataframe(rows[:max_rows], use_container_width=True)
+
+
+def metric_int(metrics: dict, key: str) -> int:
+    v = metrics.get(key)
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return int(v)
+    except Exception:
+        return 0
 
 
 # -----------------------------
-# Page
+# Streamlit App
 # -----------------------------
 st.set_page_config(page_title="YASH HealthFactors - SAP SuccessFactors EC Health Check", layout="wide")
 
 st.title("✅ YASH HealthFactors - SAP SuccessFactors EC Health Check")
 
-# -----------------------------
-# Sidebar: Connection / Inputs
-# -----------------------------
-with st.sidebar:
-    st.header("Connection")
+# Defaults
+DEFAULT_BACKEND_URL = os.getenv("BACKEND_URL", "").strip()
+if "backend_url" not in st.session_state:
+    st.session_state.backend_url = DEFAULT_BACKEND_URL
 
-    backend_url = st.text_input("Backend URL", value=st.session_state.get("backend_url", ""), placeholder="https://your-backend.onrender.com")
-    backend_url = normalize_url(backend_url)
-    st.session_state["backend_url"] = backend_url
-
-    ok, msg = backend_health(backend_url) if backend_url else (False, "Enter backend URL")
-    if ok:
-        st.success(msg)
-    else:
-        st.warning(msg)
-
-    st.divider()
-    st.subheader("Instance")
-
-    instance_url = st.text_input(
-        "Instance URL",
-        value=st.session_state.get("instance_url", ""),
-        placeholder="https://hcm41.sapsf.com",
-    )
-    instance_url = normalize_url(instance_url)
-    st.session_state["instance_url"] = instance_url
-
-    derived_api = derive_api_base_from_instance(instance_url)
-    st.text_input("Derived API base URL", value=derived_api, disabled=True)
-
-    api_override = st.text_input(
-        "API base override (optional)",
-        value=st.session_state.get("api_override", ""),
-        placeholder="https://apisalesdemo2.successfactors.eu",
-    )
-    api_override = normalize_url(api_override)
-    st.session_state["api_override"] = api_override
-
-    effective_api = api_override or derived_api
-    st.caption(f"Effective API base: {effective_api or '—'}")
-
-    st.divider()
-    st.subheader("Credentials (per tenant)")
-
-    username = st.text_input("SF Username", value=st.session_state.get("sf_username", ""))
-    st.session_state["sf_username"] = username
-
-    password = st.text_input("SF Password", type="password", value=st.session_state.get("sf_password", ""))
-    st.session_state["sf_password"] = password
-
-    company_id = st.text_input("Company ID (optional)", value=st.session_state.get("company_id", ""))
-    st.session_state["company_id"] = company_id
-
-    st.divider()
-    st.subheader("Network / Runtime")
-
-    verify_ssl = st.checkbox("Verify SSL", value=st.session_state.get("verify_ssl", True))
-    st.session_state["verify_ssl"] = verify_ssl
-
-    timeout_s = st.number_input("SF request timeout (seconds)", min_value=10, max_value=300, value=int(st.session_state.get("timeout_s", 60)))
-    st.session_state["timeout_s"] = timeout_s
-
-    st.divider()
-    st.subheader("Auto-refresh latest snapshot")
-    auto_refresh = st.toggle("Auto-refresh latest snapshot", value=st.session_state.get("auto_refresh", False))
-    st.session_state["auto_refresh"] = auto_refresh
-
-    refresh_every = st.slider("Refresh every (seconds)", min_value=10, max_value=120, value=int(st.session_state.get("refresh_every", 30)))
-    st.session_state["refresh_every"] = refresh_every
-
-    st.divider()
-    st.subheader("Display")
-    show_raw_json = st.toggle("Show raw JSON (advanced)", value=st.session_state.get("show_raw_json", False))
-    st.session_state["show_raw_json"] = show_raw_json
-
-
-# -----------------------------
-# Main actions
-# -----------------------------
-action_cols = st.columns([1, 1, 3])
-run_clicked = action_cols[0].button("🔁 Run live check now", use_container_width=True, disabled=not ok)
-refresh_clicked = action_cols[1].button("🧾 Refresh latest snapshot", use_container_width=True, disabled=not ok)
-action_cols[2].info("Tip: Run pulls live SF data via backend; Refresh loads the latest snapshot for the selected instance.")
-
-# Storage for latest metrics in session
 if "metrics" not in st.session_state:
-    st.session_state["metrics"] = None
-if "last_error" not in st.session_state:
-    st.session_state["last_error"] = None
+    st.session_state.metrics = None
 
-# If instance/company changes, clear shown metrics to avoid confusion
-current_key = f"{normalize_url(instance_url)}|{(company_id or '').strip()}"
-if st.session_state.get("scope_key") != current_key:
-    st.session_state["scope_key"] = current_key
-    st.session_state["metrics"] = None
-    st.session_state["last_error"] = None
-
-# -----------------------------
-# Run action
-# -----------------------------
-def validate_inputs() -> list[str]:
-    problems = []
-    if not backend_url:
-        problems.append("Backend URL is required")
-    if not instance_url:
-        problems.append("Instance URL is required")
-    if not effective_api:
-        problems.append("API base URL could not be derived; set API base override")
-    if not (username or "").strip():
-        problems.append("SF Username is required")
-    if not (password or "").strip():
-        problems.append("SF Password is required")
-    return problems
+if "last_scope_key" not in st.session_state:
+    st.session_state.last_scope_key = ""
 
 
-if run_clicked:
-    probs = validate_inputs()
-    if probs:
-        st.session_state["last_error"] = " • ".join(probs)
-    else:
-        try:
-            st.session_state["last_error"] = None
-            with st.spinner("Running health check via backend..."):
-                _ = call_run(
-                    backend_url=backend_url,
-                    instance_url=instance_url,
-                    api_base_url=effective_api,
-                    username=username,
-                    password=password,
-                    company_id=company_id,
-                    timeout_s=int(timeout_s),
-                    verify_ssl=bool(verify_ssl),
-                )
-            # Always refresh after run to show latest stored snapshot
-            latest = call_latest(backend_url, instance_url, company_id)
-            if latest.get("status") == "ok":
-                st.session_state["metrics"] = latest.get("metrics")
-            else:
-                st.session_state["metrics"] = None
-                st.session_state["last_error"] = "Run succeeded but no snapshot returned by /metrics/latest."
-        except Exception as e:
-            st.session_state["metrics"] = None
-            st.session_state["last_error"] = f"Run failed: {e}"
+# Sidebar - Connection
+st.sidebar.header("Connection")
+backend_url = st.sidebar.text_input("Backend URL", value=st.session_state.backend_url or "", key="backend_url_input")
+backend_url = normalize_url(backend_url)
+st.session_state.backend_url = backend_url
 
-# -----------------------------
-# Refresh action
-# -----------------------------
-if refresh_clicked:
-    try:
-        st.session_state["last_error"] = None
-        with st.spinner("Loading latest snapshot..."):
-            latest = call_latest(backend_url, instance_url, company_id)
-        if latest.get("status") == "ok":
-            st.session_state["metrics"] = latest.get("metrics")
-        else:
-            st.session_state["metrics"] = None
-            st.session_state["last_error"] = "No snapshots found yet for this instance/company. Click Run live check now."
-    except Exception as e:
-        st.session_state["metrics"] = None
-        st.session_state["last_error"] = f"Refresh failed: {e}"
+st.sidebar.caption("Streamlit calls Backend. Backend calls SuccessFactors (OData).")
 
-# -----------------------------
-# Auto refresh loop (non-blocking pattern)
-# -----------------------------
-if auto_refresh and ok and not run_clicked:
-    # Refresh silently every N seconds
-    now = time.time()
-    last = st.session_state.get("last_auto_refresh_ts", 0.0)
-    if now - last >= float(refresh_every):
-        st.session_state["last_auto_refresh_ts"] = now
-        try:
-            latest = call_latest(backend_url, instance_url, company_id)
-            if latest.get("status") == "ok":
-                st.session_state["metrics"] = latest.get("metrics")
-        except Exception:
-            pass
+# Instance section
+st.sidebar.header("Instance")
 
+instance_url = st.sidebar.text_input("Instance URL", value=st.session_state.get("instance_url", ""))
+instance_url = normalize_url(instance_url)
+st.session_state.instance_url = instance_url
 
-# -----------------------------
-# Display
-# -----------------------------
-if st.session_state.get("last_error"):
-    st.error(st.session_state["last_error"])
+derived_api = derive_api_base_from_instance(instance_url)
+st.sidebar.text_input("Derived API base URL", value=derived_api or "", disabled=True)
 
-metrics = st.session_state.get("metrics")
-if metrics:
-    st.success("Run completed ✅" if not st.session_state.get("last_error") else "Loaded snapshot ✅")
-    render_kpis(metrics)
+api_override = st.sidebar.text_input("API base override (optional)", value=st.session_state.get("api_override", ""))
+api_override = normalize_url(api_override)
+st.session_state.api_override = api_override
 
-    tab_email, tab_org, tab_mgr, tab_workforce, tab_raw = st.tabs(
-        ["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "👥 Workforce", "🔎 Raw JSON"]
-    )
-
-    with tab_email:
-        render_table(safe_get(metrics, "missing_emails_sample", []) or [], "Missing emails (sample)")
-        render_table(safe_get(metrics, "duplicate_emails_sample", []) or [], "Duplicate emails (sample)")
-
-    with tab_org:
-        render_table(safe_get(metrics, "invalid_org_sample", []) or [], "Invalid org assignments (sample)")
-
-    with tab_mgr:
-        render_table(safe_get(metrics, "missing_managers_sample", []) or [], "Missing managers (sample)")
-
-    with tab_workforce:
-        render_table(safe_get(metrics, "inactive_users_sample", []) or [], "Inactive users (sample)")
-        render_table(safe_get(metrics, "contingent_workers_sample", []) or [], "Contingent workers (sample)")
-
-    with tab_raw:
-        if show_raw_json:
-            st.code(json.dumps(metrics, indent=2), language="json")
-        else:
-            st.info("Enable **Show raw JSON (advanced)** in the sidebar to view the full payload.")
+effective_api_base = api_override or derived_api
+if effective_api_base:
+    st.sidebar.markdown(f"**Effective API base:**  \n{effective_api_base}")
 else:
+    st.sidebar.markdown("**Effective API base:**  \n_(enter Instance URL)_")
+
+# Credentials (per tenant)
+st.sidebar.header("Credentials (per tenant)")
+sf_username = st.sidebar.text_input("SF Username", value=st.session_state.get("sf_username", ""))
+sf_password = st.sidebar.text_input("SF Password", value=st.session_state.get("sf_password", ""), type="password")
+company_id = st.sidebar.text_input("Company ID (optional)", value=st.session_state.get("company_id", ""))
+company_id = (company_id or "").strip()
+
+st.session_state.sf_username = sf_username
+st.session_state.sf_password = sf_password
+st.session_state.company_id = company_id
+
+st.sidebar.header("Runtime")
+timeout = st.sidebar.number_input("HTTP timeout (sec)", min_value=10, max_value=300, value=int(st.session_state.get("timeout", 60)))
+verify_ssl = st.sidebar.toggle("Verify SSL", value=bool(st.session_state.get("verify_ssl", True)))
+st.session_state.timeout = timeout
+st.session_state.verify_ssl = verify_ssl
+
+auto_refresh = st.sidebar.toggle("Auto-refresh latest snapshot", value=bool(st.session_state.get("auto_refresh", False)))
+st.session_state.auto_refresh = auto_refresh
+refresh_every = st.sidebar.slider("Refresh every (seconds)", min_value=10, max_value=120, value=int(st.session_state.get("refresh_every", 30)))
+st.session_state.refresh_every = refresh_every
+
+
+# Backend health check
+backend_ok = False
+if backend_url:
+    try:
+        h = backend_get(backend_url, "/health", timeout=30)
+        backend_ok = bool(h.get("ok"))
+    except Exception:
+        backend_ok = False
+
+if backend_ok:
+    st.success("Backend reachable ✅")
+else:
+    st.warning("Backend not reachable (or /health failed). Check Backend URL.")
+
+
+# Scope key: avoid showing old tenant snapshot when instance/company changes
+scope_key = f"{instance_url}||{company_id}".strip()
+if scope_key != st.session_state.last_scope_key:
+    # Clear metrics on scope change so old tenant data never shows
+    st.session_state.metrics = None
+    st.session_state.last_scope_key = scope_key
+
+
+# Actions
+colA, colB, colC = st.columns([1, 1, 2])
+
+run_clicked = colA.button("🔄 Run live check now", use_container_width=True, disabled=not backend_ok)
+refresh_clicked = colB.button("🧾 Refresh latest snapshot", use_container_width=True, disabled=not backend_ok)
+
+colC.info("Tip: Run pulls live SF data via backend; Refresh loads the latest snapshot for the selected instance/company.")
+
+# Validate minimum inputs for running
+def can_run() -> tuple[bool, str]:
+    if not backend_url:
+        return False, "Backend URL is required."
+    if not instance_url:
+        return False, "Instance URL is required."
+    if not effective_api_base:
+        return False, "Could not derive API base URL. Provide API base override."
+    if not sf_username or not sf_password:
+        return False, "SF Username and SF Password are required."
+    return True, ""
+
+# Execute run
+if run_clicked:
+    ok, msg = can_run()
+    if not ok:
+        st.error(msg)
+    else:
+        payload = {
+            "instance_url": instance_url,
+            "api_base_url": effective_api_base,
+            "username": sf_username,
+            "password": sf_password,
+            "company_id": company_id or None,
+            "timeout": int(timeout),
+            "verify_ssl": bool(verify_ssl),
+        }
+        try:
+            with st.spinner("Running gates..."):
+                res = backend_post(backend_url, "/run", payload=payload, timeout=240)
+            st.session_state.metrics = res.get("metrics")
+            st.success("Run completed ✅")
+        except requests.HTTPError as e:
+            # Try to show backend error detail
+            try:
+                detail = e.response.json().get("detail")
+            except Exception:
+                detail = str(e)
+            st.error(f"Run failed: {detail}")
+        except Exception as e:
+            st.error(f"Run failed: {str(e)}")
+
+# Execute refresh
+def refresh_latest():
+    if not backend_ok:
+        return
+    if not backend_url:
+        return
+    if not instance_url:
+        return
+
+    params = {"instance_url": instance_url}
+    if company_id:
+        params["company_id"] = company_id
+
+    try:
+        res = backend_get(backend_url, "/metrics/latest", params=params, timeout=60)
+        if res.get("status") == "ok":
+            st.session_state.metrics = res.get("metrics")
+        else:
+            st.session_state.metrics = None
+    except Exception as e:
+        st.error(f"Refresh failed: {str(e)}")
+
+
+if refresh_clicked:
+    refresh_latest()
+
+# Auto-refresh
+if auto_refresh and backend_ok and instance_url:
+    st.write("")  # spacer
+    st.caption(f"Auto-refresh is ON (every {refresh_every}s).")
+    st.autorefresh(interval=refresh_every * 1000, key="autorefresh_key")
+    refresh_latest()
+
+
+# -----------------------------
+# Render Metrics + Tabs
+# -----------------------------
+metrics = st.session_state.metrics
+
+if not metrics:
     st.warning("No snapshot loaded yet for this instance/company. Click **Run live check now** or **Refresh latest snapshot**.")
+    st.stop()
+
+snapshot_time = metrics.get("snapshot_time_utc") or "unknown"
+st.caption(f"Snapshot UTC: {snapshot_time}")
+
+# Show scope (so you can confirm it’s not using old tenant)
+inst_disp = metrics.get("instance_url") or instance_url or ""
+api_disp = metrics.get("api_base_url") or effective_api_base or ""
+cid_disp = metrics.get("company_id") or company_id or ""
+st.caption(f"Instance: {inst_disp}  |  API base: {api_disp}  |  Company ID: {cid_disp}")
+
+# KPI row
+k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
+
+k1.metric("Active users", metric_int(metrics, "active_users"))
+k2.metric("EmpJob rows", metric_int(metrics, "empjob_rows"))
+k3.metric("Contingent workers", metric_int(metrics, "contingent_workers"))
+k4.metric("Inactive users", metric_int(metrics, "inactive_users"))
+k5.metric("Missing managers", metric_int(metrics, "missing_managers"))
+k6.metric("Invalid org", metric_int(metrics, "invalid_org"))
+k7.metric("Missing emails", metric_int(metrics, "missing_emails"))
+k8.metric("Risk score", metric_int(metrics, "risk_score"))
+
+# Tabs (5 tabs -> 5 variables, avoids your previous crash)
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "🧑‍🤝‍🧑 Workforce", "🔎 Raw JSON"]
+)
+
+with tab1:
+    render_table("Missing emails (sample)", safe_list(metrics.get("missing_emails_sample")))
+    render_table("Duplicate emails (sample)", safe_list(metrics.get("duplicate_emails_sample")))
+
+with tab2:
+    render_table("Invalid org (sample)", safe_list(metrics.get("invalid_org_sample")))
+    render_table("Missing mandatory org fields (sample)", safe_list(metrics.get("missing_org_fields_sample")))
+
+with tab3:
+    render_table("Missing managers (sample)", safe_list(metrics.get("missing_managers_sample")))
+    render_table("Manager self-loop / invalid manager (sample)", safe_list(metrics.get("invalid_manager_sample")))
+
+with tab4:
+    render_table("Inactive users (sample)", safe_list(metrics.get("inactive_users_sample")))
+    render_table("Contingent workers (sample)", safe_list(metrics.get("contingent_workers_sample")))
+    render_table("Workforce summary (optional)", safe_list(metrics.get("workforce_summary_sample")))
+
+with tab5:
+    st.json(metrics)
