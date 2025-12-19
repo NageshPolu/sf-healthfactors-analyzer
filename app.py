@@ -63,10 +63,6 @@ def metric_card(label: str, value: Any, help_text: Optional[str] = None):
 
 
 def derive_api_base_from_instance(instance_url: str) -> str:
-    """
-    Best-effort derivation.
-    IMPORTANT: backend will still auto-detect, this is just a convenience default.
-    """
     instance_url = normalize_url(instance_url)
     if not instance_url:
         return ""
@@ -78,11 +74,11 @@ def derive_api_base_from_instance(instance_url: str) -> str:
     if not host:
         return ""
 
-    # Common pattern: hcmXX.sapsf.com -> apiXX.sapsf.com
+    # common pattern: hcmXX.sapsf.com -> apiXX.sapsf.com
     if host.startswith("hcm") and host.endswith(".sapsf.com"):
         return "https://" + host.replace("hcm", "api", 1)
 
-    # Otherwise, many tenants expose OData on the same host
+    # otherwise try same host
     return "https://" + host
 
 
@@ -168,7 +164,7 @@ if run_clicked:
     else:
         payload = {
             "instance_url": instance_url,
-            "api_base_url": effective_api_base,  # can be empty; backend auto-detects
+            "api_base_url": effective_api_base,  # may be empty; backend should auto-detect
         }
         with st.spinner("Running checks via backend..."):
             ok_run, code_run, out = api_post(f"{backend_url}/run", payload=payload, timeout=240)
@@ -177,7 +173,7 @@ if run_clicked:
             st.session_state["force_refresh"] = True
         else:
             st.error(f"Run failed (HTTP {code_run}): {out.get('detail','Internal error')}")
-            st.session_state["force_refresh"] = True  # still refresh to show last good snapshot
+            st.session_state["force_refresh"] = True
 
 # Refresh button
 if refresh_clicked:
@@ -191,7 +187,7 @@ if auto_refresh:
         st.session_state["force_refresh"] = True
         st.session_state["last_refresh_ts"] = now
 
-# Load latest metrics (ALWAYS scoped by instance)
+# Load latest metrics (ALWAYS scoped by instance if present)
 query_instance = requests.utils.quote(instance_url or "")
 metrics_url = f"{backend_url}/metrics/latest?instance_url={query_instance}" if instance_url else f"{backend_url}/metrics/latest"
 
@@ -239,8 +235,10 @@ with k8:
 
 st.caption(metrics.get("employee_status_source") or "")
 
-# Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "👔 Workforce", "🔎 Raw JSON"])
+# ✅ FIX: 5 tabs -> 5 variables
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "👔 Workforce", "🔎 Raw JSON"]
+)
 
 with tab1:
     show_table("Missing emails (sample)", metrics.get("missing_email_sample"))
