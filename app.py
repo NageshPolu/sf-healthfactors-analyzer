@@ -1,41 +1,95 @@
+# app.py
 import os
 import time
-from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlparse, urlunparse
+from typing import Any, Dict, Tuple, Optional
+from urllib.parse import urlparse, urlencode
 
 import requests
-import pandas as pd
 import streamlit as st
+import pandas as pd
 
 
 # -----------------------------
-# Helpers
+# URL helpers
 # -----------------------------
-def normalize_url(u: str) -> str:
+def normalize_base_url(u: str) -> str:
     u = (u or "").strip()
     if not u:
         return ""
-    return u.rstrip("/")
+    u = u.strip().rstrip("/")
+    return u
 
 
+def derive_api_base_from_instance(instance_url: str) -> str:
+    """
+    Best-effort:
+      https://hcm41.sapsf.com  -> https://api41.sapsf.com
+      https://hcm10.successfactors.eu -> https://api10.successfactors.eu
+    If hostname already starts with api -> returns base.
+    """
+    instance_url = normalize_base_url(instance_url)
+    if not instance_url:
+        return ""
+
+    # ensure it parses even if user types "hcm41.sapsf.com"
+    if "://" not in instance_url:
+        instance_url = "https://" + instance_url
+
+    p = urlparse(instance_url)
+    host = (p.hostname or "").lower()
+    scheme = p.scheme or "https"
+
+    if not host:
+        return ""
+
+    if host.startswith("api"):
+        return f"{scheme}://{host}"
+
+    # pattern: hcm<digits>.<rest>
+    # e.g. hcm41.sapsf.com -> api41.sapsf.com
+    if host.startswith("hcm"):
+        tail = host[3:]  # after 'hcm'
+        # tail starts with digits? then replace prefix with api
+        digits = ""
+        rest = ""
+        for ch in tail:
+            if ch.isdigit():
+                digits += ch
+            else:
+                rest = tail[len(digits):]
+                break
+        if digits and rest.startswith("."):
+            return f"{scheme}://api{digits}{rest}"
+        # fallback: simple replace first hcm -> api
+        return f"{scheme}://{host.replace('hcm', 'api', 1)}"
+
+    return ""
+
+
+# -----------------------------
+# HTTP helpers
+# -----------------------------
 def safe_json(resp: requests.Response) -> Dict[str, Any]:
     try:
         return resp.json()
     except Exception:
-        return {"detail": resp.text[:800]}
+        return {"detail": (resp.text or "")[:800]}
 
 
-def api_get(url: str, timeout: int = 30) -> Tuple[bool, int, Dict[str, Any]]:
+def api_get(url: str, params: Optional[dict] = None, timeout: int = 30) -> Tuple[bool, int, Dict[str, Any]]:
     try:
-        r = requests.get(url, timeout=timeout)
+        # cache-bust
+        params = dict(params or {})
+        params["_ts"] = int(time.time())
+        r = requests.get(url, params=params, timeout=timeout, headers={"Cache-Control": "no-cache"})
         return r.ok, r.status_code, safe_json(r)
     except Exception as e:
         return False, 0, {"detail": str(e)}
 
 
-def api_post(url: str, payload: Dict[str, Any], timeout: int = 240) -> Tuple[bool, int, Dict[str, Any]]:
+def api_post(url: str, payload: dict, timeout: int = 180) -> Tuple[bool, int, Dict[str, Any]]:
     try:
-        r = requests.post(url, json=payload, timeout=timeout)
+        r = requests.post(url, json=payload, timeout=timeout, headers={"Cache-Control": "no-cache"})
         return r.ok, r.status_code, safe_json(r)
     except Exception as e:
         return False, 0, {"detail": str(e)}
@@ -62,56 +116,23 @@ def metric_card(label: str, value: Any, help_text: Optional[str] = None):
     st.metric(label, v, help=help_text)
 
 
-def derive_api_base_from_instance(instance_url: str) -> str:
-    """
-    Best-effort derivation:
-    https://hcm41.sapsf.com -> https://api41.sapsf.com
-    https://hcm10preview.sapsf.com -> https://api10preview.sapsf.com
-    If domain doesn't match known pattern, return normalized instance base.
-    """
-    instance_url = normalize_url(instance_url)
-    if not instance_url:
-        return ""
-
-    p = urlparse(instance_url if "://" in instance_url else f"https://{instance_url}")
-    host = (p.netloc or "").lower()
-
-    # Handle hcmXX.sapsf.com / hcmXXpreview.sapsf.com patterns
-    if host.startswith("hcm") and host.endswith(".sapsf.com"):
-        # swap leading "hcm" -> "api"
-        new_host = "api" + host[3:]
-        return urlunparse((p.scheme or "https", new_host, "", "", "", "")).rstrip("/")
-
-    # Some tenants already use api*.successfactors.* or custom domains
-    return urlunparse((p.scheme or "https", host, "", "", "", "")).rstrip("/")
-
-
-def on_connection_change():
-    # Force refresh whenever backend/instance/api changes
-    st.session_state["force_refresh"] = True
-    # Clear last shown snapshot to avoid confusing stale display
-    st.session_state.pop("last_metrics", None)
-    st.session_state.pop("last_snapshot_time", None)
-
-
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="YASH HealthFactors - EC Health Check", layout="wide")
+st.set_page_config(page_title="YASH HealthFactors - SF EC Health Check", layout="wide")
 st.title("✅ YASH HealthFactors - SAP SuccessFactors EC Health Check")
 
+# Sidebar
 with st.sidebar:
     st.header("Connection")
 
     default_backend = os.getenv("BACKEND_URL") or ""
     backend_url = st.text_input(
         "Backend URL",
-        value=st.session_state.get("backend_url", default_backend),
+        value=default_backend,
         placeholder="https://your-render-backend",
-        key="backend_url",
-        on_change=on_connection_change,
     )
-    backend_url = normalize_url(backend_url)
+    backend_url = normalize_base_url(backend_url)
 
     st.divider()
     st.subheader("Instance")
@@ -120,54 +141,38 @@ with st.sidebar:
         "Instance URL",
         value=st.session_state.get("instance_url", ""),
         placeholder="https://hcm41.sapsf.com",
-        key="instance_url",
-        on_change=on_connection_change,
     )
-    instance_url = normalize_url(instance_url)
+    instance_url = normalize_base_url(instance_url)
+    st.session_state["instance_url"] = instance_url
 
     derived_api = derive_api_base_from_instance(instance_url) if instance_url else ""
-    st.text_input(
-        "Derived API base URL",
-        value=derived_api or "",
-        disabled=True,
-        key="derived_api",
-    )
+    st.text_input("Derived API base URL", value=derived_api, disabled=True)
 
-    # IMPORTANT: default should be EMPTY so you don't accidentally keep old tenant
     api_override = st.text_input(
         "API base override (optional)",
         value=st.session_state.get("api_override", ""),
-        placeholder="Leave empty to use derived API base",
-        key="api_override",
-        on_change=on_connection_change,
+        placeholder="https://apisalesdemo2.successfactors.eu",
     )
-    api_override = normalize_url(api_override)
+    api_override = normalize_base_url(api_override)
+    st.session_state["api_override"] = api_override
 
-    api_base_url = api_override or derived_api
+    effective_api = api_override or derived_api
 
-    st.caption("Streamlit calls Render. Render calls SuccessFactors.")
-    st.caption(f"Using API base: **{api_base_url or '—'}**")
+    if instance_url and not effective_api:
+        st.warning("Could not derive API base URL. Provide API base override.")
+    elif instance_url and effective_api:
+        st.caption(f"Effective API base: {effective_api}")
 
     st.divider()
     auto_refresh = st.toggle("Auto-refresh latest snapshot", value=False)
     refresh_secs = st.slider("Refresh every (seconds)", 10, 120, 30, disabled=not auto_refresh)
 
-    st.divider()
-    show_debug = st.toggle("Show debug (recommended while fixing)", value=True)
 
+# Always show a visible status area (prevents “blank UI” feeling)
 status_box = st.empty()
 
-# Guardrails
 if not backend_url:
     status_box.warning("Enter your Render backend URL to continue.")
-    st.stop()
-
-if not instance_url:
-    status_box.warning("Enter your SuccessFactors Instance URL to continue.")
-    st.stop()
-
-if not api_base_url:
-    status_box.warning("Could not derive API base URL. Provide API base override.")
     st.stop()
 
 # Health check
@@ -179,67 +184,68 @@ else:
     status_box.error(f"Backend not healthy (HTTP {code}): {msg}")
     st.stop()
 
-# Actions row
+# Actions
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     run_clicked = st.button("🔄 Run live check now", use_container_width=True)
 with c2:
     refresh_clicked = st.button("🧾 Refresh latest snapshot", use_container_width=True)
 with c3:
-    st.info("Tip: Use **Run live check now** to pull real-time SF data via Render, then view it below.")
+    st.info("Tip: Run pulls live SF data via backend; Refresh loads the latest snapshot for the selected instance.")
 
-# Run now (THIS is what ties instance -> api_base to backend)
+# Run now
 if run_clicked:
-    payload = {"instance_url": instance_url, "api_base_url": api_base_url}
+    if not instance_url:
+        st.error("Please enter Instance URL.")
+        st.stop()
+    if not effective_api:
+        st.error("Could not derive API base URL. Please enter API base override.")
+        st.stop()
+
     with st.spinner("Running checks via backend..."):
-        ok_run, code_run, out = api_post(f"{backend_url}/run", payload=payload, timeout=300)
+        ok_run, code_run, out = api_post(
+            f"{backend_url}/run",
+            payload={"instance_url": instance_url, "api_base_url": effective_api},
+            timeout=240,
+        )
 
     if ok_run:
         st.success("Run completed ✅")
         st.session_state["force_refresh"] = True
     else:
-        # If backend is fixed correctly, you will see the REAL reason here (401/403/404/500)
         st.error(f"Run failed (HTTP {code_run}): {out.get('detail','Internal error')}")
-        if show_debug:
-            st.subheader("Run debug")
-            st.json({"request": payload, "response": out})
         st.stop()
 
-# Auto refresh / manual refresh
+# Refresh logic
 if refresh_clicked:
     st.session_state["force_refresh"] = True
 
 if auto_refresh:
-    now = time.time()
+    now_ts = time.time()
     last = st.session_state.get("last_refresh_ts", 0)
-    if (now - last) > refresh_secs:
+    if (now_ts - last) > refresh_secs:
         st.session_state["force_refresh"] = True
-        st.session_state["last_refresh_ts"] = now
+        st.session_state["last_refresh_ts"] = now_ts
 
-# Always load latest snapshot FOR THIS INSTANCE
-# This prevents showing “old url” snapshots
-metrics_url = f"{backend_url}/metrics/latest?instance_url={requests.utils.quote(instance_url)}"
-ok_m, code_m, payload = api_get(metrics_url, timeout=30)
+if st.session_state.get("force_refresh"):
+    st.session_state["force_refresh"] = False
+
+# Load latest snapshot FOR THIS INSTANCE (prevents “old URL data”)
+params = {"instance_url": instance_url} if instance_url else {}
+ok_m, code_m, payload = api_get(f"{backend_url}/metrics/latest", params=params, timeout=30)
 
 if not ok_m:
     st.error(f"Could not fetch latest snapshot (HTTP {code_m}): {payload.get('detail','Error')}")
-    if show_debug:
-        st.subheader("Metrics debug")
-        st.json({"metrics_url": metrics_url, "payload": payload})
     st.stop()
 
 if payload.get("status") == "empty":
-    st.warning("No snapshots found yet for this instance. Click **Run live check now**.")
+    st.warning("No snapshots found for this instance yet. Click **Run live check now**.")
     st.stop()
 
 metrics = payload.get("metrics") or {}
 snapshot_time = metrics.get("snapshot_time_utc", "unknown")
 
-# Save last snapshot (helps detect stale state)
-st.session_state["last_metrics"] = metrics
-st.session_state["last_snapshot_time"] = snapshot_time
-
-# KPI row
+# Top KPIs
 k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
 with k1:
     metric_card("Active users", as_int(metrics.get("active_users")))
@@ -260,18 +266,31 @@ with k8:
 
 st.caption(f"Snapshot UTC: {snapshot_time}")
 
-# Helpful context lines (if backend returns them)
-inst_line = metrics.get("instance_url") or instance_url
-api_line = metrics.get("api_base_url") or api_base_url
-st.caption(f"Instance: {inst_line}  |  API base: {api_line}")
+# Show which instance/api produced this snapshot (so you can verify no mixing)
+snap_instance = metrics.get("instance_url") or ""
+snap_api = metrics.get("api_base_url") or ""
+if snap_instance or snap_api:
+    st.caption(f"Instance: {snap_instance}  |  API base: {snap_api}")
 
-status_source = metrics.get("employee_status_source")
-cont_source = metrics.get("contingent_source")
-if status_source or cont_source:
-    st.caption(f"Employee status source: {status_source or 'unknown'} • Contingent source: {cont_source or 'unknown'}")
+# Sources/coverage
+employee_status_source = metrics.get("employee_status_source", "unknown")
+contingent_source = metrics.get("contingent_source", "unknown")
+coverage = metrics.get("emplstatus_label_coverage") or {}
+rows_with_label = coverage.get("rows_with_label")
+total_rows = coverage.get("total_rows")
+status_catalog_source = metrics.get("status_catalog_source", "not-available")
+
+st.caption(
+    f"Employee status source: {employee_status_source} | "
+    f"Status catalog: {status_catalog_source} | "
+    f"Label coverage: {rows_with_label}/{total_rows} | "
+    f"Contingent source: {contingent_source}"
+)
 
 # Tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "👥 Workforce"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["📧 Email hygiene", "🧩 Org checks", "👤 Manager checks", "👥 Workforce", "🔎 Raw JSON"]
+)
 
 with tab1:
     show_table("Missing emails (sample)", metrics.get("missing_email_sample"))
@@ -293,16 +312,15 @@ with tab4:
     show_table("Inactive users (sample)", metrics.get("inactive_users_sample"))
     show_table("Contingent workers (sample)", metrics.get("contingent_workers_sample"))
 
-if show_debug:
-    st.divider()
-    st.subheader("Debug")
-    st.json(
-        {
-            "backend_url": backend_url,
-            "instance_url": instance_url,
-            "derived_api_base": derived_api,
-            "api_override": api_override,
-            "api_base_used": api_base_url,
-            "metrics_endpoint": metrics_url,
-        }
-    )
+    st.subheader("Inactive breakdown by Employment Status")
+    by_status = metrics.get("inactive_by_status") or {}
+    if by_status:
+        df = pd.DataFrame(
+            [{"Employment Status": k, "Count": v} for k, v in by_status.items()]
+        ).sort_values("Count", ascending=False)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("No status breakdown available.")
+
+with tab5:
+    st.json(metrics)
